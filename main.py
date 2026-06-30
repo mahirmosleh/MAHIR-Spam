@@ -433,8 +433,8 @@ class FreeFireBot:
         self.squad_created_time = None
         self.last_reset_time = datetime.now()
         self.reset_interval = 1200  # 20 minutes
-        self.last_invite_time = 0
-        self.invite_delay = 1  # 0.1 second delay between invites
+        self.last_invite_time = 1
+        self.invite_delay = 2  # 0.1 second delay between invites
 
     async def start(self):
         try:
@@ -473,7 +473,7 @@ class FreeFireBot:
             self.online_task = asyncio.create_task(TcPOnLine(OnLineiP, OnLineporT, AutHToKen, self))
             self.chat_task = asyncio.create_task(TcPChaT(ChaTiP, ChaTporT, AutHToKen, self))
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
             self.authenticated = True
             self.ready = True
             print(f"✅ Bot {self.uid} started successfully")
@@ -502,11 +502,11 @@ class FreeFireBot:
                 if self.in_squad and self.online_writer:
                     await self._send_invites_to_targets()
                 
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 
             except Exception as e:
                 print(f"❌ Squad loop error for {self.uid}: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)
 
     async def _create_squad(self):
         try:
