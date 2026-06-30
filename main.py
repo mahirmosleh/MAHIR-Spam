@@ -640,7 +640,7 @@ class TargetManager:
         return True, f"Spam {status}"
 
 target_manager = TargetManager()
-bot_list = []
+global_bot_list = []
 loop = None
 
 # -------------------- FLASK LOGIN TEMPLATES --------------------
@@ -899,7 +899,6 @@ HTML_TEMPLATE = '''
     
     <script>
         let currentSearchUid = null;
-        let autoRefreshInterval = null;
         
         function showToast(msg, type) {
             const toast = document.createElement('div');
@@ -1202,7 +1201,6 @@ HTML_TEMPLATE = '''
             } catch(e) { console.error("UI Refresh Error", e); }
         }
         
-        // Auto-refresh every 8 seconds
         setInterval(loadUsers, 8080);
         setInterval(loadBotStatus, 10000);
         loadUsers();
@@ -1221,8 +1219,29 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB limit
 
-# -------------------- GLOBAL BOT MANAGEMENT --------------------
+# Global event loop reference
+event_loop = None
 global_bot_list = []
+
+# Helper function to run async operations safely
+def run_async(coro):
+    """Run an async coroutine in the global event loop"""
+    global event_loop
+    if event_loop is None:
+        # If no event loop is available, create a new one for this operation
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro)
+            loop.close()
+            return result
+        except Exception as e:
+            print(f"Error running async operation: {e}")
+            raise
+    else:
+        # Use the main event loop
+        future = asyncio.run_coroutine_threadsafe(coro, event_loop)
+        return future.result(timeout=30)
 
 @app.route('/')
 def home():
@@ -1265,9 +1284,9 @@ def process_accounts_file(file_content):
                 accounts.append((uid, password))
     return accounts
 
-async def start_bots_from_accounts(accounts):
+async def start_bots_from_accounts_async(accounts):
     """Start bots from a list of accounts"""
-    global global_bot_list, bot_list
+    global global_bot_list
     
     # Stop existing bots first
     for bot in global_bot_list:
@@ -1281,9 +1300,6 @@ async def start_bots_from_accounts(accounts):
         bot = FreeFireBot(uid, pwd)
         global_bot_list.append(bot)
     
-    # Update the global bot_list reference used elsewhere
-    bot_list = global_bot_list
-    
     # Start all bots
     if global_bot_list:
         tasks = [bot.start() for bot in global_bot_list]
@@ -1295,7 +1311,7 @@ async def start_bots_from_accounts(accounts):
 @login_required
 def api_upload_accounts():
     """Upload accounts.txt file and start bots"""
-    global loop
+    global event_loop, global_bot_list
     
     if 'file' not in request.files:
         return jsonify({'success': False, 'message': 'No file uploaded'})
@@ -1320,26 +1336,36 @@ def api_upload_accounts():
         file.seek(0)
         file.save(filepath)
         
-        # Start bots
-        if loop is None:
-            return jsonify({'success': False, 'message': 'Event loop not available'})
-        
-        result = asyncio.run_coroutine_threadsafe(
-            start_bots_from_accounts(accounts),
-            loop
-        ).result(timeout=30)
-        
-        started = sum(1 for b in global_bot_list if b.ready)
-        
-        return jsonify({
-            'success': True,
-            'message': f'Started {started}/{len(accounts)} bots successfully',
-            'stats': {
-                'total_bots': len(accounts),
-                'started_successfully': started,
-                'file_saved': filepath
-            }
-        })
+        # Start bots using the helper function
+        try:
+            # Use the global event loop or create a new one
+            if event_loop is not None and event_loop.is_running():
+                # Use existing loop
+                future = asyncio.run_coroutine_threadsafe(
+                    start_bots_from_accounts_async(accounts),
+                    event_loop
+                )
+                result = future.result(timeout=60)
+            else:
+                # Create a new loop for this operation
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(start_bots_from_accounts_async(accounts))
+                loop.close()
+            
+            started = sum(1 for b in global_bot_list if b.ready)
+            
+            return jsonify({
+                'success': True,
+                'message': f'Started {started}/{len(accounts)} bots successfully',
+                'stats': {
+                    'total_bots': len(accounts),
+                    'started_successfully': started,
+                    'file_saved': filepath
+                }
+            })
+        except Exception as e:
+            return jsonify({'success': False, 'message': f'Error starting bots: {str(e)}'})
         
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error processing file: {str(e)}'})
@@ -1348,14 +1374,26 @@ def api_upload_accounts():
 @login_required
 def api_stop_all_bots():
     """Stop all running bots"""
-    global loop, global_bot_list
+    global event_loop, global_bot_list
     
     if not global_bot_list:
         return jsonify({'success': False, 'message': 'No bots running'})
     
     try:
-        for bot in global_bot_list:
-            asyncio.run_coroutine_threadsafe(bot.stop(), loop).result(timeout=5)
+        # Stop bots using helper
+        def stop_bots():
+            for bot in global_bot_list:
+                # Create a new event loop for each stop operation if needed
+                if event_loop is not None and event_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(bot.stop(), event_loop)
+                    future.result(timeout=5)
+                else:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(bot.stop())
+                    loop.close()
+        
+        stop_bots()
         count = len(global_bot_list)
         global_bot_list.clear()
         return jsonify({'success': True, 'message': f'Stopped {count} bots'})
@@ -1419,9 +1457,7 @@ def api_add():
     uid = str(data.get('uid', ''))
     if not uid:
         return jsonify({'success': False, 'message': 'UID required'})
-    success, msg = asyncio.run_coroutine_threadsafe(
-        target_manager.add_target(uid), loop
-    ).result()
+    success, msg = run_async(target_manager.add_target(uid))
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/add-multiple', methods=['POST'])
@@ -1435,9 +1471,7 @@ def api_add_multiple():
     uids = [uid.strip() for uid in uids_str.split(',') if uid.strip()]
     added = []
     for uid in uids:
-        success, _ = asyncio.run_coroutine_threadsafe(
-            target_manager.add_target(uid), loop
-        ).result()
+        success, _ = run_async(target_manager.add_target(uid))
         if success:
             added.append(uid)
     
@@ -1454,36 +1488,28 @@ def api_remove():
     uid = str(data.get('uid', ''))
     if not uid:
         return jsonify({'success': False, 'message': 'UID required'})
-    success, msg = asyncio.run_coroutine_threadsafe(
-        target_manager.remove_target(uid), loop
-    ).result()
+    success, msg = run_async(target_manager.remove_target(uid))
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/start-spam/<uid>')
 @login_required
 def api_start_spam(uid):
     uid = str(uid)
-    success, msg = asyncio.run_coroutine_threadsafe(
-        target_manager.toggle_spam(uid, 'on'), loop
-    ).result()
+    success, msg = run_async(target_manager.toggle_spam(uid, 'on'))
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/stop-spam/<uid>')
 @login_required
 def api_stop_spam(uid):
     uid = str(uid)
-    success, msg = asyncio.run_coroutine_threadsafe(
-        target_manager.toggle_spam(uid, 'off'), loop
-    ).result()
+    success, msg = run_async(target_manager.toggle_spam(uid, 'off'))
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/stop-all')
 @login_required
 def api_stop_all():
     for uid in list(target_manager.targets.keys()):
-        asyncio.run_coroutine_threadsafe(
-            target_manager.toggle_spam(uid, 'off'), loop
-        ).result()
+        run_async(target_manager.toggle_spam(uid, 'off'))
     return jsonify({'success': True, 'message': 'All spam stopped'})
 
 @app.route('/api/bots-status')
@@ -1514,9 +1540,8 @@ def load_accounts(filepath="accounts.txt"):
 
 # -------------------- MAIN --------------------
 async def start_all_bots():
-    global global_bot_list, bot_list
+    global global_bot_list
     global_bot_list = load_accounts()
-    bot_list = global_bot_list
     
     if not global_bot_list:
         print("⚠️ No bots loaded from accounts.txt")
@@ -1537,8 +1562,8 @@ def run_flask():
     app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
 
 async def main():
-    global loop
-    loop = asyncio.get_running_loop()
+    global event_loop, global_bot_list
+    event_loop = asyncio.get_running_loop()
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
