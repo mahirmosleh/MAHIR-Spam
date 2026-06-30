@@ -11,8 +11,9 @@ import threading
 from datetime import datetime, timedelta
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, send_from_directory
 import secrets
+import base64
 
 # -------------------- EMBEDDED PROTOBUF MODULES --------------------
 _pb2_modules = {}
@@ -656,7 +657,15 @@ target_manager = TargetManager()
 bot_list = []
 loop = None
 
-# -------------------- FLASK LOGIN TEMPLATES --------------------
+# -------------------- FLASK APP --------------------
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(16)
+ADMIN_PASSWORD = "MAHIRJOD"
+
+# Create necessary directories
+os.makedirs('data', exist_ok=True)
+
+# -------------------- HTML TEMPLATES --------------------
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -759,7 +768,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🔥 MAHIR WORLD - SYSTEM MONITOR</title>
+    <title>🔥 MAHIR SYSTEM - MONITOR</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -774,95 +783,48 @@ HTML_TEMPLATE = '''
         .container { max-width: 1400px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 20px; flex-wrap: wrap; gap: 15px;}
         .logo { font-size: 2.8rem; font-weight: 800; background: linear-gradient(135deg, #ff007f, #7f00ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-shadow: 0 0 15px rgba(255,0,127,0.2); }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: rgba(255,255,255,0.03); backdrop-filter: blur(15px); border-radius: 16px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
-        .stat-card i { font-size: 2.2rem; margin-bottom: 10px; color: #ff007f; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: rgba(255,255,255,0.03); backdrop-filter: blur(15px); border-radius: 16px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.08); }
+        .stat-card i { font-size: 2rem; margin-bottom: 10px; color: #ff007f; }
         .stat-card h3 { font-size: 0.85rem; color: rgba(255,255,255,0.5); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-card .value { font-size: 2.2rem; font-weight: 800; text-shadow: 0 0 10px rgba(255,255,255,0.1); }
-        .add-section { background: rgba(255,255,255,0.02); backdrop-filter: blur(15px); border-radius: 16px; padding: 25px; margin-bottom: 30px; border: 1px solid rgba(255,255,255,0.06); }
+        .stat-card .value { font-size: 2.2rem; font-weight: 800; }
+        .section { background: rgba(255,255,255,0.02); backdrop-filter: blur(15px); border-radius: 16px; padding: 25px; margin-bottom: 30px; border: 1px solid rgba(255,255,255,0.06); }
         .input-group { display: flex; gap: 15px; margin-bottom: 15px; flex-wrap: wrap; }
-        .input-group input { flex: 1; padding: 15px 20px; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; background: rgba(0,0,0,0.4); font-size: 1rem; font-family: monospace; color: #fff; transition: 0.3s; }
-        .input-group input:focus { outline: none; border-color: #ff007f; box-shadow: 0 0 10px rgba(255,0,127,0.2); }
-        .search-box-container {
-            background: rgba(255, 0, 127, 0.05);
-            border: 1px dashed rgba(255, 0, 127, 0.3);
-            border-radius: 12px; padding: 15px; margin-bottom: 20px;
-        }
-        .btn { padding: 14px 28px; border: none; border-radius: 10px; font-weight: 600; cursor: pointer; transition: all 0.3s; font-size: 0.95rem; display: flex; align-items: center; gap: 8px; justify-content: center; }
-        .btn-primary { background: linear-gradient(135deg, #ff007f, #7f00ff); color: #fff; font-weight: 700; }
+        .input-group input, .input-group textarea { flex: 1; padding: 15px 20px; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; background: rgba(0,0,0,0.4); font-size: 1rem; font-family: monospace; color: #fff; }
+        .input-group input:focus, .input-group textarea:focus { outline: none; border-color: #ff007f; }
+        .btn { padding: 14px 28px; border: none; border-radius: 10px; font-weight: 600; cursor: pointer; transition: all 0.3s; font-size: 0.95rem; display: inline-flex; align-items: center; gap: 8px; justify-content: center; }
+        .btn-primary { background: linear-gradient(135deg, #ff007f, #7f00ff); color: #fff; }
         .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(255,0,127,0.3); }
-        .btn-danger { background: linear-gradient(135deg, #ff0844, #ffb199); color: white; }
-        .btn-danger:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(255,8,68,0.3); }
         .btn-success { background: linear-gradient(135deg, #00b09b, #96c93d); color: white; }
-        .btn-info { background: linear-gradient(135deg, #37ecba, #72afd3); color: #000; font-weight:700;}
-        .btn-warning { background: linear-gradient(135deg, #ffaa00, #ff6600); color: #000; font-weight: 700; }
-        .btn-upload { background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; font-weight:700; }
-        .btn-upload:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(118,75,162,0.3); }
-        .btn-logout { background: transparent; color: #ff4d4d; border: 1px solid #ff4d4d; padding: 8px 16px; border-radius: 8px;}
-        .btn-logout:hover { background: #ff4d4d; color: #fff; }
-        .users-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 25px; }
-        .user-card { background: rgba(255,255,255,0.02); backdrop-filter: blur(15px); border-radius: 16px; padding: 20px; border: 1px solid rgba(255,255,255,0.06); transition: all 0.3s; position: relative; overflow: hidden; }
-        .user-card:hover { transform: translateY(-5px); border-color: rgba(255,0,127,0.3); box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
+        .btn-danger { background: linear-gradient(135deg, #ff0844, #ffb199); color: white; }
+        .btn-warning { background: linear-gradient(135deg, #ffaa00, #ff6600); color: #000; }
+        .btn-sm { padding: 8px 16px; font-size: 0.8rem; }
+        .users-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
+        .user-card { background: rgba(255,255,255,0.02); border-radius: 16px; padding: 20px; border: 1px solid rgba(255,255,255,0.06); }
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.06); }
-        .user-uid { font-size: 1.1rem; font-weight: 700; font-family: monospace; background: rgba(0,0,0,0.4); padding: 6px 14px; border-radius: 20px; color: #ff007f; border: 1px solid rgba(255,0,127,0.1); }
-        .status-badge { padding: 6px 14px; border-radius: 20px; font-size: 0.75rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; gap: 6px; }
-        .online { background: rgba(0, 176, 155, 0.2); color: #00ffcc; border: 1px solid #00b09b; }
-        .offline { background: rgba(255,255,255,0.05); color: #a0aec0; border: 1px solid rgba(255,255,255,0.1); }
-        .ingame { background: rgba(255, 8, 68, 0.2); color: #ff3366; border: 1px solid #ff0844; animation: pulse 1.5s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.8; transform: scale(0.98); } }
-        .game-mode { background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; margin: 15px 0; text-align: center; font-weight: 700; font-size: 0.95rem; color: #fff; border: 1px solid rgba(255,255,255,0.03); letter-spacing: 1px; }
-        .info-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 0.9rem; }
+        .user-uid { font-family: monospace; font-weight: 700; background: rgba(0,0,0,0.4); padding: 6px 14px; border-radius: 20px; color: #ff007f; }
+        .status-badge { padding: 6px 14px; border-radius: 20px; font-size: 0.75rem; font-weight: 800; text-transform: uppercase; }
+        .online { background: rgba(0, 176, 155, 0.2); color: #00ffcc; }
+        .offline { background: rgba(255,255,255,0.05); color: #a0aec0; }
+        .ingame { background: rgba(255, 8, 68, 0.2); color: #ff3366; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+        .info-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 0.9rem; }
         .info-label { color: rgba(255,255,255,0.5); }
-        .info-value { font-weight: 600; color: #e2e8f0; }
         .spam-controls { display: flex; gap: 10px; margin-top: 15px; }
         .spam-controls .btn { flex: 1; padding: 10px; font-size: 0.85rem; }
         .remove-btn { margin-top: 12px; width: 100%; background: rgba(255,8,68,0.05); color: #ff4d4d; border: 1px solid rgba(255,8,68,0.1); }
-        .remove-btn:hover { background: #ff0844; color: white; border-color: transparent; }
-        .loading { text-align: center; padding: 50px; grid-column: 1/-1; }
-        .spinner { width: 45px; height: 45px; border: 3px solid rgba(255,0,127,0.1); border-radius: 50%; border-top-color: #ff007f; animation: spin 1s linear infinite; margin: 0 auto 20px; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .toast { position: fixed; bottom: 20px; right: 20px; background: #111; padding: 15px 25px; border-radius: 10px; z-index: 1000; animation: slideIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 10px 30px rgba(0,0,0,0.5); color:#fff; display:flex; align-items:center; gap:10px; font-weight:500;}
-        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-        .search-result-panel {
-            margin-top: 15px;
-            background: rgba(0,0,0,0.5);
-            border-radius: 12px;
-            padding: 15px;
-            border: 1px solid rgba(0,255,204,0.3);
-            display: none;
-        }
-        .search-result-panel.show { display: block; }
-        .result-actions { display: flex; gap: 12px; margin-top: 15px; flex-wrap: wrap; }
-        .btn-sm { padding: 8px 16px; font-size: 0.8rem; }
-        .bot-status-bar { background: rgba(0,0,0,0.3); border-radius: 10px; padding: 10px 15px; margin-bottom: 15px; display: flex; align-items: center; gap: 15px; flex-wrap: wrap; font-size: 0.85rem; }
+        .remove-btn:hover { background: #ff0844; color: white; }
+        .bot-status-bar { background: rgba(0,0,0,0.3); border-radius: 10px; padding: 10px 15px; margin-bottom: 15px; display: flex; align-items: center; gap: 15px; flex-wrap: wrap; }
         .bot-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
         .bot-dot.online { background: #00ffcc; }
         .bot-dot.offline { background: #ff4444; }
         .bot-dot.starting { background: #ffaa00; animation: pulse 0.5s infinite; }
-        .upload-section {
-            background: rgba(0,255,204,0.03);
-            border: 1px solid rgba(0,255,204,0.15);
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-        .upload-section .input-group {
-            margin-bottom: 0;
-        }
-        .file-input-wrapper {
-            position: relative;
-            overflow: hidden;
-            display: inline-block;
-        }
-        .file-input-wrapper input[type=file] {
-            position: absolute;
-            left: 0;
-            top: 0;
-            opacity: 0;
-            width: 100%;
-            height: 100%;
-            cursor: pointer;
-        }
+        .loading { text-align: center; padding: 50px; grid-column: 1/-1; }
+        .spinner { width: 45px; height: 45px; border: 3px solid rgba(255,0,127,0.1); border-radius: 50%; border-top-color: #ff007f; animation: spin 1s linear infinite; margin: 0 auto 20px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .toast { position: fixed; bottom: 20px; right: 20px; background: #111; padding: 15px 25px; border-radius: 10px; z-index: 1000; animation: slideIn 0.3s forwards; border: 1px solid rgba(255,255,255,0.1); color:#fff; display:flex; align-items:center; gap:10px; }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        .text-muted { color: rgba(255,255,255,0.5); font-size: 0.9rem; }
         @media (max-width: 768px) { .users-grid { grid-template-columns: 1fr; } .input-group { flex-direction: column; } .btn { width: 100%; } }
     </style>
 </head>
@@ -870,296 +832,233 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <div>
-                <div class="logo"><i class="fas fa-globe"></i> MAHIR WORLD</div>
-                <div style="color: rgba(255,255,255,0.4); font-size:0.95rem; letter-spacing:1px;">ENGINE BY MAHIR | MULTI-ACCOUNT STATUS CHECKER</div>
+                <div class="logo"><i class="fas fa-globe"></i> MAHIR SYSTEM</div>
+                <div class="text-muted">ENGINE BY MAHIR | MULTI-ACCOUNT INVITE SYSTEM</div>
             </div>
-            <a href="/logout" class="btn btn-logout"><i class="fas fa-sign-out-alt"></i> LOGOUT</a>
+            <a href="/logout" class="btn" style="background:transparent;color:#ff4d4d;border:1px solid #ff4d4d;padding:8px 16px;border-radius:8px;"><i class="fas fa-sign-out-alt"></i> LOGOUT</a>
         </div>
         
         <div class="stats-grid">
-            <div class="stat-card"><i class="fas fa-users"></i><h3>TOTAL MONITORING</h3><div class="value" id="totalUsers">0</div></div>
+            <div class="stat-card"><i class="fas fa-users"></i><h3>TOTAL TARGETS</h3><div class="value" id="totalUsers">0</div></div>
             <div class="stat-card"><i class="fas fa-bolt" style="color:#00ffcc"></i><h3>ACTIVE TARGETS</h3><div class="value" id="onlineCount">0</div></div>
-            <div class="stat-card"><i class="fas fa-network-wired"></i><h3>SPAM REPLICATORS</h3><div class="value" id="activeSpam">0</div></div>
+            <div class="stat-card"><i class="fas fa-network-wired"></i><h3>SPAM ACTIVE</h3><div class="value" id="activeSpam">0</div></div>
             <div class="stat-card"><i class="fas fa-robot"></i><h3>BOT ACCOUNTS</h3><div class="value" id="botCount">0</div></div>
         </div>
 
-        <div class="bot-status-bar" id="botStatusBar">
+        <div class="bot-status-bar">
             <span><i class="fas fa-robot"></i> BOT STATUS:</span>
             <span id="botStatusText">Loading...</span>
         </div>
 
-        <!-- UPLOAD ACCOUNTS SECTION -->
-        <div class="upload-section">
-            <h3 style="margin-bottom: 10px; color: #00ffcc; font-size: 1rem;"><i class="fas fa-upload"></i> UPLOAD ACCOUNTS.TXT</h3>
+        <!-- ACCOUNTS SECTION -->
+        <div class="section">
+            <h3 style="margin-bottom: 15px; color: #00ffcc;"><i class="fas fa-key"></i> ACCOUNTS MANAGEMENT</h3>
             <div class="input-group">
-                <div class="file-input-wrapper" style="flex: 1;">
-                    <button class="btn btn-upload" style="width:100%;"><i class="fas fa-file-upload"></i> SELECT accounts.txt FILE</button>
-                    <input type="file" id="accountFileInput" accept=".txt" onchange="uploadAccountsFile(event)">
-                </div>
-                <button class="btn btn-primary" onclick="restartBots()"><i class="fas fa-sync-alt"></i> RESTART BOTS</button>
+                <textarea id="accountsText" placeholder="Enter accounts (UID:PASSWORD)&#10;Example:&#10;123456789:password123&#10;987654321:pass456" rows="5" style="flex:1;padding:15px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(0,0,0,0.4);color:#fff;font-family:monospace;"></textarea>
             </div>
-            <div id="uploadStatus" style="margin-top: 10px; color: rgba(255,255,255,0.5); font-size: 0.9rem;"></div>
+            <div style="display:flex;gap:15px;flex-wrap:wrap;">
+                <button class="btn btn-success" onclick="saveAccounts()"><i class="fas fa-save"></i> SAVE ACCOUNTS</button>
+                <button class="btn btn-primary" onclick="restartBots()"><i class="fas fa-sync-alt"></i> RESTART BOTS</button>
+                <button class="btn btn-warning" onclick="loadAccounts()"><i class="fas fa-download"></i> LOAD FROM FILE</button>
+            </div>
+            <div id="accountStatus" style="margin-top:10px;color:rgba(255,255,255,0.5);"></div>
         </div>
 
-        <div class="search-box-container">
-            <h3 style="margin-bottom: 10px; color: #ff007f; font-size: 1rem;"><i class="fas fa-search"></i> TARGET UID FINDER & CONTROL</h3>
+        <!-- TARGET MANAGEMENT -->
+        <div class="section">
+            <h3 style="margin-bottom: 15px; color: #ff007f;"><i class="fas fa-crosshairs"></i> TARGET MANAGEMENT</h3>
             <div class="input-group">
-                <input type="text" id="searchUidInput" placeholder="Enter UID to check if it's in target/monitored list...">
-                <button class="btn btn-primary" style="background: #7f00ff;" onclick="searchTargetUid()"><i class="fas fa-radar"></i> FIND TARGET</button>
-            </div>
-            <div id="searchResultPanel" class="search-result-panel">
-                <div id="searchResultInfo" style="font-weight: 600;"></div>
-                <div class="result-actions" id="searchResultActions"></div>
-            </div>
-        </div>
-        
-        <div class="add-section">
-            <div class="input-group">
-                <input type="text" id="singleUid" placeholder="INPUT SINGLE TARGET UID (e.g., 4149483200)">
-                <button class="btn btn-primary" onclick="addSingleUser()"><i class="fas fa-plus-circle"></i> INJECT UID</button>
-                <button class="btn btn-danger" onclick="stopAllSpam()"><i class="fas fa-power-off"></i> TERMINATE ALL SPAM</button>
+                <input type="text" id="singleUid" placeholder="Target UID (e.g., 4149483200)">
+                <button class="btn btn-primary" onclick="addSingleUser()"><i class="fas fa-plus"></i> ADD TARGET</button>
+                <button class="btn btn-danger" onclick="stopAllSpam()"><i class="fas fa-stop"></i> STOP ALL</button>
             </div>
             <div class="input-group">
-                <input type="text" id="multiUid" placeholder="BULK INJECTION (COMMA SEPARATED: 4149483200,4575104506)">
-                <button class="btn btn-primary" onclick="addMultipleUsers()"><i class="fas fa-compress-alt"></i> BULK INJECT</button>
+                <input type="text" id="multiUid" placeholder="Bulk UIDs (comma separated: 123,456,789)">
+                <button class="btn btn-primary" onclick="addMultipleUsers()"><i class="fas fa-plus-circle"></i> BULK ADD</button>
             </div>
+            <div class="input-group">
+                <input type="text" id="searchUid" placeholder="Search UID...">
+                <button class="btn btn-primary" style="background:#7f00ff;" onclick="searchTarget()"><i class="fas fa-search"></i> SEARCH</button>
+            </div>
+            <div id="searchResult" style="margin-top:10px;display:none;background:rgba(0,0,0,0.3);padding:15px;border-radius:10px;"></div>
         </div>
         
         <div class="users-grid" id="usersGrid">
-            <div class="loading"><div class="spinner"></div><p style="color:rgba(255,255,255,0.5)">INITIALIZING NET CHANNEL...</p></div>
+            <div class="loading"><div class="spinner"></div><p class="text-muted">LOADING TARGETS...</p></div>
         </div>
     </div>
     
     <script>
-        let currentSearchUid = null;
-        
         function showToast(msg, type) {
             const toast = document.createElement('div');
             toast.className = 'toast';
             const colors = {success:'linear-gradient(135deg, #00b09b, #96c93d)', error:'linear-gradient(135deg, #ff0844, #ffb199)', info:'linear-gradient(135deg, #ff007f, #7f00ff)'};
             toast.style.background = colors[type] || colors.info;
-            toast.innerHTML = `<i class="fas ${type==='success'?'fa-check-circle':type==='error'?'fa-exclamation-circle':'fa-info-circle'}"></i> <span>${msg}</span>`;
+            toast.innerHTML = `<i class="fas ${type==='success'?'fa-check-circle':type==='error'?'fa-exclamation-circle':'fa-info-circle'}"></i> ${msg}`;
             document.body.appendChild(toast);
             setTimeout(() => toast.remove(), 3000);
         }
 
-        async function uploadAccountsFile(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            
-            const formData = new FormData();
-            formData.append('file', file);
-            
-            document.getElementById('uploadStatus').innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
+        async function saveAccounts() {
+            const text = document.getElementById('accountsText').value;
+            if(!text.trim()) { showToast('Please enter accounts', 'error'); return; }
             
             try {
-                const res = await fetch('/api/upload-accounts', {
+                const res = await fetch('/api/save-accounts', {
                     method: 'POST',
-                    body: formData
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({accounts: text})
                 });
                 const data = await res.json();
-                
-                if (data.success) {
+                if(data.success) {
                     showToast(`✅ ${data.message}`, 'success');
-                    document.getElementById('uploadStatus').innerHTML = `✅ Uploaded ${data.count} accounts. Click "RESTART BOTS" to activate.`;
+                    document.getElementById('accountStatus').innerHTML = `✅ ${data.message}`;
                 } else {
                     showToast(`❌ ${data.message}`, 'error');
-                    document.getElementById('uploadStatus').innerHTML = `❌ ${data.message}`;
                 }
-            } catch(e) {
-                showToast('Upload failed', 'error');
-                document.getElementById('uploadStatus').innerHTML = '❌ Upload failed';
-            }
-            
-            event.target.value = '';
+            } catch(e) { showToast('Save failed', 'error'); }
+        }
+
+        async function loadAccounts() {
+            try {
+                const res = await fetch('/api/load-accounts');
+                const data = await res.json();
+                if(data.success && data.accounts) {
+                    document.getElementById('accountsText').value = data.accounts;
+                    showToast('Accounts loaded', 'success');
+                } else {
+                    showToast('No accounts found', 'error');
+                }
+            } catch(e) { showToast('Load failed', 'error'); }
         }
 
         async function restartBots() {
             showToast('🔄 Restarting bots...', 'info');
             try {
-                const res = await fetch('/api/restart-bots', {
-                    method: 'POST'
-                });
+                const res = await fetch('/api/restart-bots', {method: 'POST'});
                 const data = await res.json();
-                if (data.success) {
+                if(data.success) {
                     showToast(`✅ ${data.message}`, 'success');
-                    document.getElementById('uploadStatus').innerHTML = `✅ ${data.message}`;
+                    document.getElementById('accountStatus').innerHTML = `✅ ${data.message}`;
                     loadBotStatus();
                 } else {
                     showToast(`❌ ${data.message}`, 'error');
                 }
-            } catch(e) {
-                showToast('Restart failed', 'error');
-            }
+            } catch(e) { showToast('Restart failed', 'error'); }
         }
 
-        async function searchTargetUid() {
-            const uid = document.getElementById('searchUidInput').value.trim();
-            const panel = document.getElementById('searchResultPanel');
-            const infoDiv = document.getElementById('searchResultInfo');
-            const actionsDiv = document.getElementById('searchResultActions');
-            
-            if(!uid) { showToast('Please enter a UID to find','error'); return; }
-            currentSearchUid = uid;
+        async function searchTarget() {
+            const uid = document.getElementById('searchUid').value.trim();
+            if(!uid) { showToast('Enter UID to search', 'error'); return; }
             
             try {
                 const res = await fetch(`/api/search/${uid}`);
                 const data = await res.json();
-                panel.classList.add('show');
+                const div = document.getElementById('searchResult');
+                div.style.display = 'block';
                 
                 if(data.found) {
-                    const spamStatusText = data.spam_status === 'on' ? 'ACTIVE 🔴' : 'IDLE ⚪';
-                    const statusColor = data.is_online ? '#00ffcc' : '#ff6666';
-                    infoDiv.innerHTML = `
-                        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-                            <div><i class="fas fa-check-circle" style="color:#00ffcc;"></i> <strong style="color:#ff007f;">TARGET FOUND</strong><br>
-                            <span style="font-family: monospace; font-size: 1.1rem;">UID: ${data.uid}</span><br>
-                            Status: <span style="color: ${statusColor};">${data.status}</span> | Mode: ${data.mode}<br>
-                            Replicator: <span style="color: ${data.spam_status === 'on' ? '#ff3366' : '#888'};">${spamStatusText}</span>
-                            ${data.is_captain ? '<br><span style="color:#ff9900;"><i class="fas fa-crown"></i> TEAM CAPTAIN</span>' : ''}
-                            </div>
+                    div.innerHTML = `
+                        <div style="color:#00ffcc;">✅ TARGET FOUND</div>
+                        <div>UID: <strong>${data.uid}</strong></div>
+                        <div>Status: ${data.status} | Mode: ${data.mode}</div>
+                        <div>Spam: ${data.spam_status === 'on' ? '🟢 ACTIVE' : '⚪ IDLE'}</div>
+                        <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;">
+                            ${data.spam_status === 'on' ? 
+                                `<button class="btn btn-warning btn-sm" onclick="toggleSpam('${data.uid}','off')">STOP</button>` :
+                                `<button class="btn btn-success btn-sm" onclick="toggleSpam('${data.uid}','on')">START</button>`
+                            }
+                            <button class="btn btn-danger btn-sm" onclick="removeTarget('${data.uid}')">REMOVE</button>
                         </div>
                     `;
-                    
-                    let actionHtml = '';
-                    if(data.spam_status === 'on') {
-                        actionHtml += `<button class="btn btn-warning btn-sm" onclick="quickStopSpam('${data.uid}')"><i class="fas fa-pause"></i> STOP SPAM</button>`;
-                    } else {
-                        actionHtml += `<button class="btn btn-success btn-sm" onclick="quickStartSpam('${data.uid}')"><i class="fas fa-play"></i> START SPAM</button>`;
-                    }
-                    actionHtml += `<button class="btn btn-danger btn-sm" onclick="quickRemoveTarget('${data.uid}')"><i class="fas fa-trash"></i> REMOVE TARGET</button>`;
-                    actionHtml += `<button class="btn btn-info btn-sm" onclick="refreshTargetStatus('${data.uid}')"><i class="fas fa-sync-alt"></i> REFRESH STATUS</button>`;
-                    actionsDiv.innerHTML = actionHtml;
-                    showToast('Target found in database!', 'success');
                 } else {
-                    infoDiv.innerHTML = `<i class="fas fa-times-circle" style="color:#ff4d4d;"></i> ${data.message}<br>
-                        <span style="font-size:0.85rem;">Use "INJECT UID" to add this target to monitoring.</span>`;
-                    actionsDiv.innerHTML = `<button class="btn btn-primary btn-sm" onclick="quickAddTarget('${uid}')"><i class="fas fa-plus"></i> ADD TO MONITORING</button>`;
-                    showToast('Target not found', 'error');
+                    div.innerHTML = `<div style="color:#ff4444;">❌ ${data.message}</div>
+                        <button class="btn btn-primary btn-sm" onclick="quickAdd('${uid}')">ADD TARGET</button>`;
                 }
-            } catch(e) {
-                showToast('Search Failed', 'error');
-                panel.classList.remove('show');
-            }
+            } catch(e) { showToast('Search failed', 'error'); }
         }
-        
-        async function quickStopSpam(uid) {
+
+        async function quickAdd(uid) {
             try {
-                const res = await fetch(`/api/stop-spam/${uid}`);
+                const res = await fetch('/api/add', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({uid})
+                });
+                const data = await res.json();
+                if(data.success) { showToast(data.message, 'success'); loadUsers(); searchTarget(); }
+                else showToast(data.message, 'error');
+            } catch(e) { showToast('Add failed', 'error'); }
+        }
+
+        async function toggleSpam(uid, status) {
+            try {
+                const res = await fetch(`/api/toggle-spam/${uid}/${status}`);
                 const data = await res.json();
                 showToast(data.message, data.success?'success':'error');
-                if(data.success) { loadUsers(); searchTargetUid(); }
-            } catch(e) { showToast('Spam Stop Failed', 'error'); }
+                if(data.success) { loadUsers(); searchTarget(); }
+            } catch(e) { showToast('Toggle failed', 'error'); }
         }
-        
-        async function quickStartSpam(uid) {
+
+        async function removeTarget(uid) {
+            if(!confirm(`Remove UID ${uid}?`)) return;
             try {
-                const res = await fetch(`/api/start-spam/${uid}`);
+                const res = await fetch('/api/remove', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({uid})
+                });
                 const data = await res.json();
                 showToast(data.message, data.success?'success':'error');
-                if(data.success) { loadUsers(); searchTargetUid(); }
-            } catch(e) { showToast('Spam Start Failed', 'error'); }
+                if(data.success) { loadUsers(); document.getElementById('searchResult').style.display = 'none'; }
+            } catch(e) { showToast('Remove failed', 'error'); }
         }
-        
-        async function quickRemoveTarget(uid) {
-            if(!confirm(`⚠️ Are you sure you want to permanently remove UID ${uid} from monitoring?`)) return;
-            try {
-                const res = await fetch('/api/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({uid})});
-                const data = await res.json();
-                showToast(data.message, data.success?'success':'error');
-                if(data.success) { 
-                    loadUsers(); 
-                    document.getElementById('searchResultPanel').classList.remove('show');
-                    document.getElementById('searchUidInput').value = '';
-                }
-            } catch(e) { showToast('Remove Failed', 'error'); }
-        }
-        
-        async function quickAddTarget(uid) {
-            try {
-                const res = await fetch('/api/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({uid})});
-                const data = await res.json();
-                if(data.success) { 
-                    showToast(data.message, 'success'); 
-                    loadUsers(); 
-                    searchTargetUid();
-                } else showToast(data.message, 'error');
-            } catch(e) { showToast('Add Failed', 'error'); }
-        }
-        
-        async function refreshTargetStatus(uid) {
-            showToast('Fetching latest status...', 'info');
-            try {
-                const res = await fetch(`/api/status/${uid}`);
-                const data = await res.json();
-                showToast(`Status: ${data.status} | Mode: ${data.mode}`, 'info');
-                loadUsers();
-                searchTargetUid();
-            } catch(e) { showToast('Status refresh failed', 'error'); }
-        }
-        
+
         async function addSingleUser() {
             const uid = document.getElementById('singleUid').value.trim();
-            if(!uid) { showToast('UID Field Cannot Be Empty','error'); return; }
+            if(!uid) { showToast('Enter UID', 'error'); return; }
             try {
-                const res = await fetch('/api/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({uid})});
+                const res = await fetch('/api/add', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({uid})
+                });
                 const data = await res.json();
-                if(data.success) { showToast(data.message,'success'); document.getElementById('singleUid').value=''; loadUsers(); }
-                else showToast(data.message,'error');
-            } catch(e) { showToast('Core Pipeline Rejection','error'); }
+                showToast(data.message, data.success?'success':'error');
+                if(data.success) { document.getElementById('singleUid').value = ''; loadUsers(); }
+            } catch(e) { showToast('Add failed', 'error'); }
         }
-        
+
         async function addMultipleUsers() {
             const uids = document.getElementById('multiUid').value.trim();
-            if(!uids) { showToast('Bulk Field Empty','error'); return; }
+            if(!uids) { showToast('Enter UIDs', 'error'); return; }
             try {
-                const res = await fetch('/api/add-multiple', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({uids})});
+                const res = await fetch('/api/add-multiple', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({uids})
+                });
                 const data = await res.json();
-                if(data.success) { showToast(data.message,'success'); document.getElementById('multiUid').value=''; loadUsers(); }
-            } catch(e) { showToast('Bulk Pipeline Rejection','error'); }
+                showToast(data.message, 'success');
+                if(data.success) { document.getElementById('multiUid').value = ''; loadUsers(); }
+            } catch(e) { showToast('Bulk add failed', 'error'); }
         }
-        
-        async function removeUser(uid) {
-            try {
-                const res = await fetch('/api/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({uid})});
-                const data = await res.json();
-                if(data.success) { showToast(data.message,'success'); loadUsers(); }
-            } catch(e) { showToast('Purge Command Failed','error'); }
-        }
-        
-        async function startSpam(uid) {
-            try {
-                const res = await fetch(`/api/start-spam/${uid}`);
-                const data = await res.json();
-                showToast(data.message, data.success?'success':'error');
-                if(data.success) loadUsers();
-            } catch(e) { showToast('Spam Thread Lock Error','error'); }
-        }
-        
-        async function stopSpam(uid) {
-            try {
-                const res = await fetch(`/api/stop-spam/${uid}`);
-                const data = await res.json();
-                showToast(data.message, data.success?'success':'error');
-                if(data.success) loadUsers();
-            } catch(e) { showToast('Spam Thread Release Error','error'); }
-        }
-        
+
         async function stopAllSpam() {
             try {
                 const res = await fetch('/api/stop-all');
                 const data = await res.json();
-                showToast(data.message,'success');
+                showToast(data.message, 'success');
                 loadUsers();
-            } catch(e) { showToast('Global Shutdown Failed','error'); }
+            } catch(e) { showToast('Stop all failed', 'error'); }
         }
-        
+
         function getStatusClass(status) {
             if(status === 'INGAME' || status === 'INSQUAD') return 'ingame';
             if(status === 'OFFLINE') return 'offline';
             return 'online';
         }
-        
+
         async function loadBotStatus() {
             try {
                 const res = await fetch('/api/bots-status');
@@ -1169,21 +1068,14 @@ HTML_TEMPLATE = '''
                 document.getElementById('botCount').textContent = total;
                 const statusText = document.getElementById('botStatusText');
                 if(total === 0) {
-                    statusText.innerHTML = '<span style="color:#ff4444;">⚠️ No bot accounts loaded. Upload accounts.txt</span>';
+                    statusText.innerHTML = '<span style="color:#ff4444;">⚠️ No bot accounts loaded. Add accounts below.</span>';
                 } else {
                     statusText.innerHTML = `${online}/${total} bots ready ` + 
-                        bots.map(b => {
-                            let cls = 'offline';
-                            if(b.ready) cls = 'online';
-                            else if(!b.authenticated) cls = 'starting';
-                            return `<span class="bot-dot ${cls}"></span>`;
-                        }).join('');
+                        bots.map(b => `<span class="bot-dot ${b.ready?'online':'offline'}"></span>`).join('');
                 }
-            } catch(e) {
-                console.error('Bot status error', e);
-            }
+            } catch(e) { console.error('Bot status error', e); }
         }
-        
+
         async function loadUsers() {
             try {
                 const res = await fetch('/api/users');
@@ -1193,51 +1085,54 @@ HTML_TEMPLATE = '''
                 document.getElementById('onlineCount').textContent = data.online_count;
                 document.getElementById('activeSpam').textContent = data.active_spam;
                 const grid = document.getElementById('usersGrid');
-                if(data.total===0) { grid.innerHTML='<div class="loading"><i class="fas fa-folder-open" style="font-size:3rem;opacity:0.2;margin-bottom:15px;"></i><p style="color:rgba(255,255,255,0.3)">DATABASE IS EMPTY. INJECT TARGETS TO SCAN.</p></div>'; return; }
+                if(data.total===0) {
+                    grid.innerHTML = '<div class="loading"><i class="fas fa-folder-open" style="font-size:3rem;opacity:0.2;margin-bottom:15px;"></i><p class="text-muted">No targets added. Add targets above.</p></div>';
+                    return;
+                }
                 
-                let htmlBuffer = '';
+                let html = '';
                 for(const [uid,user] of Object.entries(data.users)) {
                     const cls = getStatusClass(user.status);
-                    htmlBuffer += `
-                        <div class="user-card" style="${user.is_captain ? 'border: 1px dashed #ff9900; background: rgba(255,153,0,0.01);' : ''}">
+                    html += `
+                        <div class="user-card" style="${user.is_captain ? 'border: 1px dashed #ff9900;' : ''}">
                             <div class="card-header">
                                 <span class="user-uid"><i class="fas fa-fingerprint"></i> ${uid}</span>
                                 <span class="status-badge ${cls}"><i class="fas ${user.is_online?'fa-bolt':'fa-eye-slash'}"></i> ${user.status}</span>
                             </div>
-                            
-                            ${user.is_captain ? `<div style="font-size:0.75rem; text-align:center; color:#ff9900; background:rgba(255,153,0,0.1); padding:4px; border-radius:5px; margin-bottom:10px; font-weight:700;"><i class="fas fa-crown"></i> AUTO-CAPTURED TEAM CAPTAIN</div>` : ''}
-
-                            <div class="game-mode"><i class="fas fa-crosshairs"></i> MODE: ${user.mode}</div>
-                            <div class="info-row"><span class="info-label"><i class="fas fa-robot"></i> REPLICATOR:</span><span class="info-value" style="color:${user.spam_status==='on'?'#00ffcc':'#718096'}">${user.spam_status==='on'?'⚡ ACTIVE':'⚡ IDLE'}</span></div>
-                            <div class="info-row"><span class="info-label"><i class="fas fa-clock"></i> LIFESPAN:</span><span class="info-value" style="color:${user.is_captain ? '#ff9900':'#ff007f'}">${user.rem_time}</span></div>
-                            ${user.time_playing?`<div class="info-row"><span class="info-label"><i class="fas fa-stopwatch"></i> MATCH TIME:</span><span class="info-value" style="color:#ff007f">${user.time_playing}</span></div>`:''}
-                            ${user.squad_owner?`<div class="info-row"><span class="info-label"><i class="fas fa-crown"></i> TEAM CAPTAIN:</span><span class="info-value" style="color:#ff9900">${user.squad_owner}</span></div>`:''}
-                            ${user.squad_size?`<div class="info-row"><span class="info-label"><i class="fas fa-users-cog"></i> TEAM SIZE:</span><span class="info-value" style="color:#00ffcc">${user.squad_size}</span></div>`:''}
+                            <div style="text-align:center;padding:10px;background:rgba(0,0,0,0.2);border-radius:8px;margin:10px 0;">MODE: ${user.mode}</div>
+                            <div class="info-row"><span class="info-label">REPLICATOR:</span><span style="color:${user.spam_status==='on'?'#00ffcc':'#718096'}">${user.spam_status==='on'?'⚡ ACTIVE':'⚡ IDLE'}</span></div>
+                            <div class="info-row"><span class="info-label">LIFESPAN:</span><span style="color:#ff007f">${user.rem_time}</span></div>
+                            ${user.squad_owner ? `<div class="info-row"><span class="info-label">CAPTAIN:</span><span style="color:#ff9900">${user.squad_owner}</span></div>` : ''}
+                            ${user.squad_size ? `<div class="info-row"><span class="info-label">TEAM SIZE:</span><span style="color:#00ffcc">${user.squad_size}</span></div>` : ''}
                             <div class="spam-controls">
-                                ${user.spam_status==='on'? `<button class="btn btn-danger" onclick="stopSpam('${uid}')"><i class="fas fa-pause"></i> STOP</button>` : `<button class="btn btn-success" onclick="startSpam('${uid}')"><i class="fas fa-play"></i> RUN</button>`}
+                                ${user.spam_status==='on' ? 
+                                    `<button class="btn btn-danger" onclick="toggleSpam('${uid}','off')"><i class="fas fa-pause"></i> STOP</button>` :
+                                    `<button class="btn btn-success" onclick="toggleSpam('${uid}','on')"><i class="fas fa-play"></i> START</button>`
+                                }
                             </div>
-                            <button class="btn remove-btn" onclick="removeUser('${uid}')"><i class="fas fa-trash-alt"></i> PURGE TARGET</button>
+                            <button class="btn remove-btn" onclick="removeTarget('${uid}')"><i class="fas fa-trash"></i> REMOVE</button>
                         </div>
                     `;
                 }
-                grid.innerHTML = htmlBuffer;
-            } catch(e) { console.error("UI Refresh Error", e); }
+                grid.innerHTML = html;
+            } catch(e) { console.error("UI Error", e); }
         }
-        
-        setInterval(loadUsers, 8080);
+
+        // Load accounts on page load
+        window.onload = function() {
+            loadAccounts();
+            loadUsers();
+            loadBotStatus();
+        };
+
+        setInterval(loadUsers, 5000);
         setInterval(loadBotStatus, 10000);
-        loadUsers();
-        loadBotStatus();
     </script>
 </body>
 </html>
 '''
 
-# -------------------- FLASK APP --------------------
-app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)
-ADMIN_PASSWORD = "MAHIRJOD"
-
+# -------------------- FLASK ROUTES --------------------
 @app.route('/')
 def home():
     if not session.get('logged_in'):
@@ -1265,22 +1160,13 @@ def login_required(f):
     decorated.__name__ = f.__name__
     return decorated
 
-@app.route('/api/upload-accounts', methods=['POST'])
+@app.route('/api/save-accounts', methods=['POST'])
 @login_required
-def api_upload_accounts():
+def api_save_accounts():
     try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'message': 'No file uploaded'})
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'success': False, 'message': 'No file selected'})
-        
-        if not file.filename.endswith('.txt'):
-            return jsonify({'success': False, 'message': 'Only .txt files allowed'})
-        
-        content = file.read().decode('utf-8')
-        lines = content.strip().split('\n')
+        data = request.json
+        accounts_text = data.get('accounts', '')
+        lines = accounts_text.strip().split('\n')
         valid_accounts = []
         
         for line in lines:
@@ -1291,16 +1177,30 @@ def api_upload_accounts():
                     valid_accounts.append(f"{parts[0].strip()}:{parts[1].strip()}")
         
         if not valid_accounts:
-            return jsonify({'success': False, 'message': 'No valid accounts found in file'})
+            return jsonify({'success': False, 'message': 'No valid accounts found'})
         
         with open('accounts.txt', 'w') as f:
             f.write('\n'.join(valid_accounts))
         
         return jsonify({
             'success': True,
-            'message': f'Uploaded {len(valid_accounts)} accounts',
-            'count': len(valid_accounts)
+            'message': f'Saved {len(valid_accounts)} accounts'
         })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/load-accounts')
+@login_required
+def api_load_accounts():
+    try:
+        if not os.path.exists('accounts.txt'):
+            return jsonify({'success': True, 'accounts': ''})
+        
+        with open('accounts.txt', 'r') as f:
+            content = f.read()
+        
+        return jsonify({'success': True, 'accounts': content})
     
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
@@ -1316,15 +1216,8 @@ def api_restart_bots():
             asyncio.run_coroutine_threadsafe(bot.stop(), loop)
         
         bot_list = []
-        
-        # Reset global lock
         global_invite_lock = asyncio.Lock()
         
-        # Load new accounts
-        def load_bots():
-            return load_accounts()
-        
-        # Start new bots
         async def start_bots():
             global bot_list
             bot_list = load_accounts()
@@ -1386,22 +1279,6 @@ def api_search(uid):
         })
     return jsonify({'found': False, 'message': 'Target not found'})
 
-@app.route('/api/status/<uid>')
-@login_required
-def api_status(uid):
-    uid = str(uid)
-    data = target_manager.targets.get(uid)
-    if data:
-        return jsonify({
-            'uid': uid,
-            'status': data.get('status', 'UNKNOWN'),
-            'mode': data.get('mode', 'IDLE'),
-            'spam_status': data.get('spam_status', 'off'),
-            'is_captain': data.get('is_captain', False),
-            'is_online': data.get('is_online', False)
-        })
-    return jsonify({'error': 'Target not found'}), 404
-
 @app.route('/api/add', methods=['POST'])
 @login_required
 def api_add():
@@ -1449,21 +1326,14 @@ def api_remove():
     ).result()
     return jsonify({'success': success, 'message': msg})
 
-@app.route('/api/start-spam/<uid>')
+@app.route('/api/toggle-spam/<uid>/<status>')
 @login_required
-def api_start_spam(uid):
+def api_toggle_spam(uid, status):
     uid = str(uid)
+    if status not in ['on', 'off']:
+        return jsonify({'success': False, 'message': 'Invalid status'})
     success, msg = asyncio.run_coroutine_threadsafe(
-        target_manager.toggle_spam(uid, 'on'), loop
-    ).result()
-    return jsonify({'success': success, 'message': msg})
-
-@app.route('/api/stop-spam/<uid>')
-@login_required
-def api_stop_spam(uid):
-    uid = str(uid)
-    success, msg = asyncio.run_coroutine_threadsafe(
-        target_manager.toggle_spam(uid, 'off'), loop
+        target_manager.toggle_spam(uid, status), loop
     ).result()
     return jsonify({'success': success, 'message': msg})
 
@@ -1511,7 +1381,6 @@ async def start_all_bots():
         print("⚠️ No bots loaded")
         return
     
-    # Create global lock for all bots
     global_invite_lock = asyncio.Lock()
     
     print(f"\n📱 Starting {len(bot_list)} bots...")
@@ -1520,12 +1389,10 @@ async def start_all_bots():
     
     ready = sum(1 for b in bot_list if b.ready)
     print(f"\n✅ {ready}/{len(bot_list)} bots ready")
-    print("🔄 Bots will auto-create squads and send invites continuously")
-    print("⏰ Auto-reset every 20 minutes")
-    print("📨 Each bot sends invites one by one with 1 second delay between bots")
 
 def run_flask():
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 async def main():
     global loop
@@ -1538,8 +1405,9 @@ async def main():
     print("\n" + "="*50)
     print("🔥 MAHIR SYSTEM v2.0")
     print("="*50)
-    print("🌐 Web Panel: http://localhost:8080")
-    print("🔑 Default Password: MAHIRJOD")
+    port = os.environ.get('PORT', 8080)
+    print(f"🌐 Web Panel: http://localhost:{port}")
+    print(f"🔑 Default Password: MAHIRJOD")
     print("="*50)
     
     await start_all_bots()
@@ -1549,13 +1417,10 @@ async def main():
     print("📋 Features:")
     print("  ✅ Auto-create squad on bot start")
     print("  ✅ Continuous invite spam to targets")
-    print("  ✅ 1 second delay between bots sending invites")
-    print("  ✅ Auto-exit and recreate squad")
+    print("  ✅ 1 second delay between bots")
     print("  ✅ Auto-reset every 20 minutes")
     print("  ✅ Target management from web panel")
-    print("  ✅ Real-time bot status with dots")
-    print("  ✅ Upload accounts.txt from web panel")
-    print("  ✅ Restart bots after upload")
+    print("  ✅ Save/Load accounts from web panel")
     print("="*50)
     
     while True:
