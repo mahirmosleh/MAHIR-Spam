@@ -1160,6 +1160,7 @@ def login_required(f):
     decorated.__name__ = f.__name__
     return decorated
 
+# ==================== POST API ROUTES ====================
 @app.route('/api/save-accounts', methods=['POST'])
 @login_required
 def api_save_accounts():
@@ -1357,6 +1358,236 @@ def api_bots_status():
         'in_squad': b.in_squad
     } for b in bot_list])
 
+# ==================== GET API ROUTES WITH QUERY PARAMETERS ====================
+
+@app.route('/add')
+@login_required
+def api_add_get():
+    """Add target using GET: /add?uid=123456789"""
+    uid = request.args.get('uid', '')
+    if not uid:
+        return jsonify({'success': False, 'message': 'UID parameter required. Use ?uid=123456789'})
+    
+    uid = str(uid)
+    success, msg = asyncio.run_coroutine_threadsafe(
+        target_manager.add_target(uid), loop
+    ).result()
+    
+    return jsonify({
+        'success': success, 
+        'message': msg,
+        'uid': uid,
+        'action': 'add'
+    })
+
+@app.route('/remove')
+@login_required
+def api_remove_get():
+    """Remove target using GET: /remove?uid=123456789"""
+    uid = request.args.get('uid', '')
+    if not uid:
+        return jsonify({'success': False, 'message': 'UID parameter required. Use ?uid=123456789'})
+    
+    uid = str(uid)
+    success, msg = asyncio.run_coroutine_threadsafe(
+        target_manager.remove_target(uid), loop
+    ).result()
+    
+    return jsonify({
+        'success': success, 
+        'message': msg,
+        'uid': uid,
+        'action': 'remove'
+    })
+
+@app.route('/spam')
+@login_required
+def api_spam_get():
+    """Toggle spam using GET: /spam?uid=123456789&status=on or /spam?uid=123456789&status=off"""
+    uid = request.args.get('uid', '')
+    status = request.args.get('status', '')
+    
+    if not uid:
+        return jsonify({'success': False, 'message': 'UID parameter required. Use ?uid=123456789'})
+    
+    if status not in ['on', 'off']:
+        return jsonify({'success': False, 'message': 'Status parameter required. Use ?status=on or ?status=off'})
+    
+    uid = str(uid)
+    success, msg = asyncio.run_coroutine_threadsafe(
+        target_manager.toggle_spam(uid, status), loop
+    ).result()
+    
+    return jsonify({
+        'success': success, 
+        'message': msg,
+        'uid': uid,
+        'status': status,
+        'action': 'toggle_spam'
+    })
+
+@app.route('/status')
+@login_required
+def api_status_get():
+    """Get target status: /status?uid=123456789"""
+    uid = request.args.get('uid', '')
+    if not uid:
+        return jsonify({'success': False, 'message': 'UID parameter required. Use ?uid=123456789'})
+    
+    uid = str(uid)
+    data = target_manager.targets.get(uid)
+    if data:
+        return jsonify({
+            'success': True,
+            'uid': uid,
+            'status': data.get('status', 'UNKNOWN'),
+            'mode': data.get('mode', 'IDLE'),
+            'spam_status': data.get('spam_status', 'off'),
+            'is_captain': data.get('is_captain', False),
+            'is_online': data.get('is_online', False),
+            'rem_time': data.get('rem_time', '00:00'),
+            'squad_owner': data.get('squad_owner', ''),
+            'squad_size': data.get('squad_size', '')
+        })
+    return jsonify({'success': False, 'message': 'Target not found'})
+
+@app.route('/list')
+@login_required
+def api_list_get():
+    """List all targets: /list"""
+    return jsonify({
+        'success': True,
+        'total': len(target_manager.targets),
+        'targets': target_manager.targets
+    })
+
+@app.route('/clear')
+@login_required
+def api_clear_get():
+    """Clear all targets: /clear"""
+    count = len(target_manager.targets)
+    target_manager.targets.clear()
+    target_manager.save_targets()
+    return jsonify({
+        'success': True,
+        'message': f'Cleared {count} targets',
+        'count': count
+    })
+
+@app.route('/bots')
+@login_required
+def api_bots_get():
+    """Get bot information: /bots"""
+    return jsonify({
+        'success': True,
+        'total_bots': len(bot_list),
+        'ready_bots': sum(1 for b in bot_list if b.ready),
+        'bots': [{
+            'uid': b.uid,
+            'ready': b.ready,
+            'authenticated': b.authenticated,
+            'in_squad': b.in_squad,
+            'account_uid': b.account_uid,
+            'region': b.region
+        } for b in bot_list]
+    })
+
+@app.route('/help')
+@login_required
+def api_help():
+    """API Help: /help"""
+    help_text = """
+    🔥 MAHIR SYSTEM API GUIDE 🔥
+    
+    ======================================
+    GET API ENDPOINTS (Query Parameters)
+    ======================================
+    
+    1. ADD TARGET
+       /add?uid=123456789
+    
+    2. REMOVE TARGET
+       /remove?uid=123456789
+    
+    3. TOGGLE SPAM
+       /spam?uid=123456789&status=on
+       /spam?uid=123456789&status=off
+    
+    4. TARGET STATUS
+       /status?uid=123456789
+    
+    5. LIST ALL TARGETS
+       /list
+    
+    6. CLEAR ALL TARGETS
+       /clear
+    
+    7. BOT INFORMATION
+       /bots
+    
+    8. API HELP
+       /help
+    
+    ======================================
+    POST API ENDPOINTS
+    ======================================
+    
+    1. SAVE ACCOUNTS
+       POST /api/save-accounts
+       Body: {"accounts": "uid:pass\\nuid2:pass2"}
+    
+    2. LOAD ACCOUNTS
+       GET /api/load-accounts
+    
+    3. RESTART BOTS
+       POST /api/restart-bots
+    
+    4. ADD TARGET (POST)
+       POST /api/add
+       Body: {"uid": "123456789"}
+    
+    5. ADD MULTIPLE (POST)
+       POST /api/add-multiple
+       Body: {"uids": "123,456,789"}
+    
+    6. REMOVE TARGET (POST)
+       POST /api/remove
+       Body: {"uid": "123456789"}
+    
+    7. TOGGLE SPAM (POST)
+       GET /api/toggle-spam/123456789/on
+       GET /api/toggle-spam/123456789/off
+    
+    8. STOP ALL SPAM
+       GET /api/stop-all
+    
+    9. USERS LIST
+       GET /api/users
+    
+    10. BOTS STATUS
+        GET /api/bots-status
+    
+    ======================================
+    """
+    return jsonify({
+        'success': True,
+        'help': help_text
+    })
+
+# ==================== QUICK URL EXAMPLES ====================
+# 
+# Add Target:     /add?uid=123456789
+# Remove Target:  /remove?uid=123456789
+# Start Spam:     /spam?uid=123456789&status=on
+# Stop Spam:      /spam?uid=123456789&status=off
+# Target Status:  /status?uid=123456789
+# List Targets:   /list
+# Clear All:      /clear
+# Bots Info:      /bots
+# API Help:       /help
+#
+# =============================================================
+
 # -------------------- LOAD ACCOUNTS --------------------
 def load_accounts(filepath="accounts.txt"):
     bots = []
@@ -1421,6 +1652,9 @@ async def main():
     print("  ✅ Auto-reset every 20 minutes")
     print("  ✅ Target management from web panel")
     print("  ✅ Save/Load accounts from web panel")
+    print("  ✅ GET API: /add?uid=123, /remove?uid=123")
+    print("  ✅ GET API: /spam?uid=123&status=on/off")
+    print("  ✅ GET API: /status?uid=123, /list, /clear, /bots")
     print("="*50)
     
     while True:
