@@ -1160,7 +1160,6 @@ def login_required(f):
     decorated.__name__ = f.__name__
     return decorated
 
-# ==================== POST API ROUTES ====================
 @app.route('/api/save-accounts', methods=['POST'])
 @login_required
 def api_save_accounts():
@@ -1652,9 +1651,6 @@ async def main():
     print("  ✅ Auto-reset every 20 minutes")
     print("  ✅ Target management from web panel")
     print("  ✅ Save/Load accounts from web panel")
-    print("  ✅ GET API: /add?uid=123, /remove?uid=123")
-    print("  ✅ GET API: /spam?uid=123&status=on/off")
-    print("  ✅ GET API: /status?uid=123, /list, /clear, /bots")
     print("="*50)
     
     while True:
