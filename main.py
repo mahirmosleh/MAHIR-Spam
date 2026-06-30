@@ -8,12 +8,10 @@ import json
 import os
 import re
 import threading
-import hashlib
 from datetime import datetime, timedelta
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
-from werkzeug.utils import secure_filename
 import secrets
 
 # -------------------- EMBEDDED PROTOBUF MODULES --------------------
@@ -91,6 +89,11 @@ PorTs_pb2 = _exec_pb2_module('GetLoginDataRes_pb2', _GetLoginDataRes_pb2_source)
 # -------------------- ENCRYPTION & UTILITIES --------------------
 Key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 Iv = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+
+# Global variable to track last invite time across all bots
+global_last_invite_time = 0
+# Global lock for invite synchronization
+global_invite_lock = None
 
 async def EnC_PacKeT(HeX, K, V):
     return AES.new(K, AES.MODE_CBC, V).encrypt(pad(bytes.fromhex(HeX), 16)).hex()
@@ -436,8 +439,7 @@ class FreeFireBot:
         self.last_reset_time = datetime.now()
         self.reset_interval = 1200  # 20 minutes
         self.last_invite_time = 0
-        self.invite_delay = 0.1  # 0.1 second delay between invites
-        self.running = True
+        self.invite_delay = 1  # 1 second delay between invites for this bot
 
     async def start(self):
         try:
@@ -488,7 +490,9 @@ class FreeFireBot:
             return False
 
     async def _squad_management_loop(self):
-        while self.running and self.ready:
+        global global_invite_lock, global_last_invite_time
+        
+        while self.ready:
             try:
                 if self.squad_created_time:
                     time_elapsed = (datetime.now() - self.squad_created_time).total_seconds()
@@ -505,11 +509,12 @@ class FreeFireBot:
                 if self.in_squad and self.online_writer:
                     await self._send_invites_to_targets()
                 
-                await asyncio.sleep(2)
+                # Bot will wait 1 second before next invite cycle
+                await asyncio.sleep(1)
                 
             except Exception as e:
                 print(f"❌ Squad loop error for {self.uid}: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
     async def _create_squad(self):
         try:
@@ -539,39 +544,47 @@ class FreeFireBot:
             return False
 
     async def _send_invites_to_targets(self):
-        """Send invites to all active targets one by one with 0.1s delay"""
+        """Send invites to all active targets one by one with 1 second delay between bots"""
+        global global_invite_lock, global_last_invite_time
+        
         if not target_manager.targets:
             return
         
+        # Ensure global lock exists
+        if global_invite_lock is None:
+            global_invite_lock = asyncio.Lock()
+        
         for target_uid in list(target_manager.targets.keys()):
-            if not self.running:
-                break
             if target_manager.targets.get(target_uid, {}).get('spam_status') != 'on':
                 continue
             
-            # Enforce 0.1 second delay between invites
-            current_time = time.time()
-            time_since_last = current_time - self.last_invite_time
-            if time_since_last < self.invite_delay:
-                await asyncio.sleep(self.invite_delay - time_since_last)
-            
-            try:
-                A = await cHSq(1000, target_uid, self.key, self.iv, self.region)
-                self.online_writer.write(A)
-                await self.online_writer.drain()
+            # Global lock to ensure only one bot sends invite at a time
+            async with global_invite_lock:
+                # Wait 1 second after last invite globally
+                current_time = time.time()
+                time_since_last = current_time - global_last_invite_time
+                if time_since_last < 1:
+                    await asyncio.sleep(1 - time_since_last)
                 
-                C = await SEnd_InV(1000, target_uid, self.key, self.iv, self.region)
-                self.online_writer.write(C)
-                await self.online_writer.drain()
-                
-                self.last_invite_time = time.time()
-                print(f"📨 Bot {self.uid} invited {target_uid}")
-                
-            except Exception as e:
-                print(f"❌ Bot {self.uid} invite error for {target_uid}: {e}")
+                try:
+                    A = await cHSq(1000, target_uid, self.key, self.iv, self.region)
+                    self.online_writer.write(A)
+                    await self.online_writer.drain()
+                    
+                    C = await SEnd_InV(1000, target_uid, self.key, self.iv, self.region)
+                    self.online_writer.write(C)
+                    await self.online_writer.drain()
+                    
+                    global_last_invite_time = time.time()
+                    print(f"📨 Bot {self.uid} invited {target_uid}")
+                    
+                    # Small delay after sending invite
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"❌ Bot {self.uid} invite error for {target_uid}: {e}")
 
     async def stop(self):
-        self.running = False
         self.ready = False
         if self.online_writer:
             self.online_writer.close()
@@ -640,7 +653,7 @@ class TargetManager:
         return True, f"Spam {status}"
 
 target_manager = TargetManager()
-global_bot_list = []
+bot_list = []
 loop = None
 
 # -------------------- FLASK LOGIN TEMPLATES --------------------
@@ -768,10 +781,8 @@ HTML_TEMPLATE = '''
         .stat-card .value { font-size: 2.2rem; font-weight: 800; text-shadow: 0 0 10px rgba(255,255,255,0.1); }
         .add-section { background: rgba(255,255,255,0.02); backdrop-filter: blur(15px); border-radius: 16px; padding: 25px; margin-bottom: 30px; border: 1px solid rgba(255,255,255,0.06); }
         .input-group { display: flex; gap: 15px; margin-bottom: 15px; flex-wrap: wrap; }
-        .input-group input, .input-group input[type="file"] { flex: 1; padding: 15px 20px; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; background: rgba(0,0,0,0.4); font-size: 1rem; font-family: monospace; color: #fff; transition: 0.3s; }
+        .input-group input { flex: 1; padding: 15px 20px; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; background: rgba(0,0,0,0.4); font-size: 1rem; font-family: monospace; color: #fff; transition: 0.3s; }
         .input-group input:focus { outline: none; border-color: #ff007f; box-shadow: 0 0 10px rgba(255,0,127,0.2); }
-        .input-group input[type="file"] { padding: 12px; cursor: pointer; }
-        .input-group input[type="file"]::file-selector-button { background: linear-gradient(135deg, #ff007f, #7f00ff); border: none; color: white; padding: 8px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; margin-right: 10px; }
         .search-box-container {
             background: rgba(255, 0, 127, 0.05);
             border: 1px dashed rgba(255, 0, 127, 0.3);
@@ -785,10 +796,10 @@ HTML_TEMPLATE = '''
         .btn-success { background: linear-gradient(135deg, #00b09b, #96c93d); color: white; }
         .btn-info { background: linear-gradient(135deg, #37ecba, #72afd3); color: #000; font-weight:700;}
         .btn-warning { background: linear-gradient(135deg, #ffaa00, #ff6600); color: #000; font-weight: 700; }
+        .btn-upload { background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; font-weight:700; }
+        .btn-upload:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(118,75,162,0.3); }
         .btn-logout { background: transparent; color: #ff4d4d; border: 1px solid #ff4d4d; padding: 8px 16px; border-radius: 8px;}
         .btn-logout:hover { background: #ff4d4d; color: #fff; }
-        .btn-upload { background: linear-gradient(135deg, #00b09b, #96c93d); color: #fff; font-weight:700; }
-        .btn-upload:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,176,155,0.3); }
         .users-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 25px; }
         .user-card { background: rgba(255,255,255,0.02); backdrop-filter: blur(15px); border-radius: 16px; padding: 20px; border: 1px solid rgba(255,255,255,0.06); transition: all 0.3s; position: relative; overflow: hidden; }
         .user-card:hover { transform: translateY(-5px); border-color: rgba(255,0,127,0.3); box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
@@ -828,10 +839,30 @@ HTML_TEMPLATE = '''
         .bot-dot.online { background: #00ffcc; }
         .bot-dot.offline { background: #ff4444; }
         .bot-dot.starting { background: #ffaa00; animation: pulse 0.5s infinite; }
-        .upload-status { margin-top: 10px; padding: 10px; border-radius: 8px; display: none; }
-        .upload-status.success { background: rgba(0,176,155,0.1); border: 1px solid #00b09b; color: #00ffcc; display: block; }
-        .upload-status.error { background: rgba(255,8,68,0.1); border: 1px solid #ff0844; color: #ff6666; display: block; }
-        .upload-status .btn-restart { background: #ff007f; color: white; border: none; padding: 6px 15px; border-radius: 6px; cursor: pointer; margin-left: 10px; }
+        .upload-section {
+            background: rgba(0,255,204,0.03);
+            border: 1px solid rgba(0,255,204,0.15);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .upload-section .input-group {
+            margin-bottom: 0;
+        }
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+        }
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: 0;
+            top: 0;
+            opacity: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
         @media (max-width: 768px) { .users-grid { grid-template-columns: 1fr; } .input-group { flex-direction: column; } .btn { width: 100%; } }
     </style>
 </head>
@@ -858,14 +889,16 @@ HTML_TEMPLATE = '''
         </div>
 
         <!-- UPLOAD ACCOUNTS SECTION -->
-        <div class="add-section" style="border-color: rgba(0,176,155,0.3);">
-            <h3 style="margin-bottom: 10px; color: #00ffcc; font-size: 1rem;"><i class="fas fa-cloud-upload-alt"></i> UPLOAD ACCOUNTS.TXT</h3>
+        <div class="upload-section">
+            <h3 style="margin-bottom: 10px; color: #00ffcc; font-size: 1rem;"><i class="fas fa-upload"></i> UPLOAD ACCOUNTS.TXT</h3>
             <div class="input-group">
-                <input type="file" id="accountsFile" accept=".txt">
-                <button class="btn btn-upload" onclick="uploadAccounts()"><i class="fas fa-upload"></i> UPLOAD & START BOTS</button>
-                <button class="btn btn-danger" onclick="stopAllBots()"><i class="fas fa-stop-circle"></i> STOP ALL BOTS</button>
+                <div class="file-input-wrapper" style="flex: 1;">
+                    <button class="btn btn-upload" style="width:100%;"><i class="fas fa-file-upload"></i> SELECT accounts.txt FILE</button>
+                    <input type="file" id="accountFileInput" accept=".txt" onchange="uploadAccountsFile(event)">
+                </div>
+                <button class="btn btn-primary" onclick="restartBots()"><i class="fas fa-sync-alt"></i> RESTART BOTS</button>
             </div>
-            <div id="uploadStatus" class="upload-status"></div>
+            <div id="uploadStatus" style="margin-top: 10px; color: rgba(255,255,255,0.5); font-size: 0.9rem;"></div>
         </div>
 
         <div class="search-box-container">
@@ -910,32 +943,16 @@ HTML_TEMPLATE = '''
             setTimeout(() => toast.remove(), 3000);
         }
 
-        function showUploadStatus(msg, type) {
-            const div = document.getElementById('uploadStatus');
-            div.className = 'upload-status ' + type;
-            div.innerHTML = msg;
-        }
-
-        async function uploadAccounts() {
-            const fileInput = document.getElementById('accountsFile');
-            const statusDiv = document.getElementById('uploadStatus');
-            
-            if (!fileInput.files || fileInput.files.length === 0) {
-                showToast('Please select an accounts.txt file first', 'error');
-                return;
-            }
-            
-            const file = fileInput.files[0];
-            if (!file.name.endsWith('.txt')) {
-                showToast('Please upload a .txt file', 'error');
-                return;
-            }
+        async function uploadAccountsFile(event) {
+            const file = event.target.files[0];
+            if (!file) return;
             
             const formData = new FormData();
             formData.append('file', file);
             
+            document.getElementById('uploadStatus').innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
+            
             try {
-                showUploadStatus('⏳ Uploading and starting bots...', 'success');
                 const res = await fetch('/api/upload-accounts', {
                     method: 'POST',
                     body: formData
@@ -943,30 +960,36 @@ HTML_TEMPLATE = '''
                 const data = await res.json();
                 
                 if (data.success) {
-                    showUploadStatus(`✅ ${data.message}<br>📊 ${data.stats.total_bots} accounts loaded, ${data.stats.started_successfully} bots started successfully`, 'success');
-                    showToast('Accounts uploaded successfully!', 'success');
-                    if (data.stats.started_successfully > 0) {
-                        loadBotStatus();
-                    }
+                    showToast(`✅ ${data.message}`, 'success');
+                    document.getElementById('uploadStatus').innerHTML = `✅ Uploaded ${data.count} accounts. Click "RESTART BOTS" to activate.`;
                 } else {
-                    showUploadStatus(`❌ ${data.message}`, 'error');
-                    showToast('Upload failed: ' + data.message, 'error');
+                    showToast(`❌ ${data.message}`, 'error');
+                    document.getElementById('uploadStatus').innerHTML = `❌ ${data.message}`;
                 }
             } catch(e) {
-                showUploadStatus('❌ Error uploading file: ' + e.message, 'error');
-                showToast('Upload error', 'error');
+                showToast('Upload failed', 'error');
+                document.getElementById('uploadStatus').innerHTML = '❌ Upload failed';
             }
+            
+            event.target.value = '';
         }
 
-        async function stopAllBots() {
-            if (!confirm('⚠️ Are you sure you want to stop ALL bots?')) return;
+        async function restartBots() {
+            showToast('🔄 Restarting bots...', 'info');
             try {
-                const res = await fetch('/api/stop-all-bots');
+                const res = await fetch('/api/restart-bots', {
+                    method: 'POST'
+                });
                 const data = await res.json();
-                showToast(data.message, data.success ? 'success' : 'error');
-                if (data.success) loadBotStatus();
+                if (data.success) {
+                    showToast(`✅ ${data.message}`, 'success');
+                    document.getElementById('uploadStatus').innerHTML = `✅ ${data.message}`;
+                    loadBotStatus();
+                } else {
+                    showToast(`❌ ${data.message}`, 'error');
+                }
             } catch(e) {
-                showToast('Error stopping bots', 'error');
+                showToast('Restart failed', 'error');
             }
         }
 
@@ -1146,7 +1169,7 @@ HTML_TEMPLATE = '''
                 document.getElementById('botCount').textContent = total;
                 const statusText = document.getElementById('botStatusText');
                 if(total === 0) {
-                    statusText.innerHTML = '<span style="color:#ffaa00;">⚠️ No bot accounts loaded. Upload accounts.txt to start bots.</span>';
+                    statusText.innerHTML = '<span style="color:#ff4444;">⚠️ No bot accounts loaded. Upload accounts.txt</span>';
                 } else {
                     statusText.innerHTML = `${online}/${total} bots ready ` + 
                         bots.map(b => {
@@ -1214,34 +1237,6 @@ HTML_TEMPLATE = '''
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 ADMIN_PASSWORD = "MAHIRJOD"
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB limit
-
-# Global event loop reference
-event_loop = None
-global_bot_list = []
-
-# Helper function to run async operations safely
-def run_async(coro):
-    """Run an async coroutine in the global event loop"""
-    global event_loop
-    if event_loop is None:
-        # If no event loop is available, create a new one for this operation
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(coro)
-            loop.close()
-            return result
-        except Exception as e:
-            print(f"Error running async operation: {e}")
-            raise
-    else:
-        # Use the main event loop
-        future = asyncio.run_coroutine_threadsafe(coro, event_loop)
-        return future.result(timeout=30)
 
 @app.route('/')
 def home():
@@ -1270,135 +1265,92 @@ def login_required(f):
     decorated.__name__ = f.__name__
     return decorated
 
-def process_accounts_file(file_content):
-    """Process uploaded accounts.txt file and return list of (uid, password)"""
-    accounts = []
-    for line in file_content.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        parts = line.split(":", 1)
-        if len(parts) == 2:
-            uid, password = parts[0].strip(), parts[1].strip()
-            if uid and password:
-                accounts.append((uid, password))
-    return accounts
-
-async def start_bots_from_accounts_async(accounts):
-    """Start bots from a list of accounts"""
-    global global_bot_list
-    
-    # Stop existing bots first
-    for bot in global_bot_list:
-        await bot.stop()
-    
-    # Clear the list
-    global_bot_list.clear()
-    
-    # Create new bots
-    for uid, pwd in accounts:
-        bot = FreeFireBot(uid, pwd)
-        global_bot_list.append(bot)
-    
-    # Start all bots
-    if global_bot_list:
-        tasks = [bot.start() for bot in global_bot_list]
-        await asyncio.gather(*tasks)
-    
-    return global_bot_list
-
 @app.route('/api/upload-accounts', methods=['POST'])
 @login_required
 def api_upload_accounts():
-    """Upload accounts.txt file and start bots"""
-    global event_loop, global_bot_list
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'message': 'No file uploaded'})
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'success': False, 'message': 'No file selected'})
+        
+        if not file.filename.endswith('.txt'):
+            return jsonify({'success': False, 'message': 'Only .txt files allowed'})
+        
+        content = file.read().decode('utf-8')
+        lines = content.strip().split('\n')
+        valid_accounts = []
+        
+        for line in lines:
+            line = line.strip()
+            if line and ':' in line:
+                parts = line.split(':', 1)
+                if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                    valid_accounts.append(f"{parts[0].strip()}:{parts[1].strip()}")
+        
+        if not valid_accounts:
+            return jsonify({'success': False, 'message': 'No valid accounts found in file'})
+        
+        with open('accounts.txt', 'w') as f:
+            f.write('\n'.join(valid_accounts))
+        
+        return jsonify({
+            'success': True,
+            'message': f'Uploaded {len(valid_accounts)} accounts',
+            'count': len(valid_accounts)
+        })
     
-    if 'file' not in request.files:
-        return jsonify({'success': False, 'message': 'No file uploaded'})
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'success': False, 'message': 'No file selected'})
-    
-    if not file.filename.endswith('.txt'):
-        return jsonify({'success': False, 'message': 'File must be a .txt file'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/restart-bots', methods=['POST'])
+@login_required
+def api_restart_bots():
+    global bot_list, loop, global_invite_lock
     
     try:
-        content = file.read().decode('utf-8')
-        accounts = process_accounts_file(content)
+        # Stop existing bots
+        for bot in bot_list:
+            asyncio.run_coroutine_threadsafe(bot.stop(), loop)
         
-        if not accounts:
-            return jsonify({'success': False, 'message': 'No valid accounts found in file. Format: UID:PASSWORD'})
+        bot_list = []
         
-        # Save file for reference
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.seek(0)
-        file.save(filepath)
+        # Reset global lock
+        global_invite_lock = asyncio.Lock()
         
-        # Start bots using the helper function
-        try:
-            # Use the global event loop or create a new one
-            if event_loop is not None and event_loop.is_running():
-                # Use existing loop
-                future = asyncio.run_coroutine_threadsafe(
-                    start_bots_from_accounts_async(accounts),
-                    event_loop
-                )
-                result = future.result(timeout=60)
-            else:
-                # Create a new loop for this operation
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(start_bots_from_accounts_async(accounts))
-                loop.close()
+        # Load new accounts
+        def load_bots():
+            return load_accounts()
+        
+        # Start new bots
+        async def start_bots():
+            global bot_list
+            bot_list = load_accounts()
+            if not bot_list:
+                return False
             
-            started = sum(1 for b in global_bot_list if b.ready)
-            
+            tasks = [bot.start() for bot in bot_list]
+            await asyncio.gather(*tasks)
+            return True
+        
+        success = asyncio.run_coroutine_threadsafe(start_bots(), loop).result()
+        
+        if success:
+            ready = sum(1 for b in bot_list if b.ready)
             return jsonify({
                 'success': True,
-                'message': f'Started {started}/{len(accounts)} bots successfully',
-                'stats': {
-                    'total_bots': len(accounts),
-                    'started_successfully': started,
-                    'file_saved': filepath
-                }
+                'message': f'Restarted {len(bot_list)} bots ({ready} ready)'
             })
-        except Exception as e:
-            return jsonify({'success': False, 'message': f'Error starting bots: {str(e)}'})
-        
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Error processing file: {str(e)}'})
-
-@app.route('/api/stop-all-bots')
-@login_required
-def api_stop_all_bots():
-    """Stop all running bots"""
-    global event_loop, global_bot_list
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'No accounts loaded'
+            })
     
-    if not global_bot_list:
-        return jsonify({'success': False, 'message': 'No bots running'})
-    
-    try:
-        # Stop bots using helper
-        def stop_bots():
-            for bot in global_bot_list:
-                # Create a new event loop for each stop operation if needed
-                if event_loop is not None and event_loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(bot.stop(), event_loop)
-                    future.result(timeout=5)
-                else:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(bot.stop())
-                    loop.close()
-        
-        stop_bots()
-        count = len(global_bot_list)
-        global_bot_list.clear()
-        return jsonify({'success': True, 'message': f'Stopped {count} bots'})
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error stopping bots: {str(e)}'})
+        return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/users')
 @login_required
@@ -1457,7 +1409,9 @@ def api_add():
     uid = str(data.get('uid', ''))
     if not uid:
         return jsonify({'success': False, 'message': 'UID required'})
-    success, msg = run_async(target_manager.add_target(uid))
+    success, msg = asyncio.run_coroutine_threadsafe(
+        target_manager.add_target(uid), loop
+    ).result()
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/add-multiple', methods=['POST'])
@@ -1471,7 +1425,9 @@ def api_add_multiple():
     uids = [uid.strip() for uid in uids_str.split(',') if uid.strip()]
     added = []
     for uid in uids:
-        success, _ = run_async(target_manager.add_target(uid))
+        success, _ = asyncio.run_coroutine_threadsafe(
+            target_manager.add_target(uid), loop
+        ).result()
         if success:
             added.append(uid)
     
@@ -1488,28 +1444,36 @@ def api_remove():
     uid = str(data.get('uid', ''))
     if not uid:
         return jsonify({'success': False, 'message': 'UID required'})
-    success, msg = run_async(target_manager.remove_target(uid))
+    success, msg = asyncio.run_coroutine_threadsafe(
+        target_manager.remove_target(uid), loop
+    ).result()
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/start-spam/<uid>')
 @login_required
 def api_start_spam(uid):
     uid = str(uid)
-    success, msg = run_async(target_manager.toggle_spam(uid, 'on'))
+    success, msg = asyncio.run_coroutine_threadsafe(
+        target_manager.toggle_spam(uid, 'on'), loop
+    ).result()
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/stop-spam/<uid>')
 @login_required
 def api_stop_spam(uid):
     uid = str(uid)
-    success, msg = run_async(target_manager.toggle_spam(uid, 'off'))
+    success, msg = asyncio.run_coroutine_threadsafe(
+        target_manager.toggle_spam(uid, 'off'), loop
+    ).result()
     return jsonify({'success': success, 'message': msg})
 
 @app.route('/api/stop-all')
 @login_required
 def api_stop_all():
     for uid in list(target_manager.targets.keys()):
-        run_async(target_manager.toggle_spam(uid, 'off'))
+        asyncio.run_coroutine_threadsafe(
+            target_manager.toggle_spam(uid, 'off'), loop
+        ).result()
     return jsonify({'success': True, 'message': 'All spam stopped'})
 
 @app.route('/api/bots-status')
@@ -1521,7 +1485,7 @@ def api_bots_status():
         'authenticated': b.authenticated,
         'online_writer': b.online_writer is not None,
         'in_squad': b.in_squad
-    } for b in global_bot_list])
+    } for b in bot_list])
 
 # -------------------- LOAD ACCOUNTS --------------------
 def load_accounts(filepath="accounts.txt"):
@@ -1540,30 +1504,32 @@ def load_accounts(filepath="accounts.txt"):
 
 # -------------------- MAIN --------------------
 async def start_all_bots():
-    global global_bot_list
-    global_bot_list = load_accounts()
+    global bot_list, global_invite_lock
     
-    if not global_bot_list:
-        print("⚠️ No bots loaded from accounts.txt")
-        print("📤 Upload accounts.txt via web panel to start bots")
+    bot_list = load_accounts()
+    if not bot_list:
+        print("⚠️ No bots loaded")
         return
     
-    print(f"\n📱 Starting {len(global_bot_list)} bots...")
-    tasks = [bot.start() for bot in global_bot_list]
+    # Create global lock for all bots
+    global_invite_lock = asyncio.Lock()
+    
+    print(f"\n📱 Starting {len(bot_list)} bots...")
+    tasks = [bot.start() for bot in bot_list]
     await asyncio.gather(*tasks)
     
-    ready = sum(1 for b in global_bot_list if b.ready)
-    print(f"\n✅ {ready}/{len(global_bot_list)} bots ready")
+    ready = sum(1 for b in bot_list if b.ready)
+    print(f"\n✅ {ready}/{len(bot_list)} bots ready")
     print("🔄 Bots will auto-create squads and send invites continuously")
     print("⏰ Auto-reset every 20 minutes")
-    print("📨 Each bot sends invites one by one with 0.1s delay")
+    print("📨 Each bot sends invites one by one with 1 second delay between bots")
 
 def run_flask():
     app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
 
 async def main():
-    global event_loop, global_bot_list
-    event_loop = asyncio.get_running_loop()
+    global loop
+    loop = asyncio.get_running_loop()
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
@@ -1575,23 +1541,21 @@ async def main():
     print("🌐 Web Panel: http://localhost:8080")
     print("🔑 Default Password: MAHIRJOD")
     print("="*50)
-    print("📤 Upload accounts.txt via web panel to start bots")
-    print("="*50)
     
-    # Try to load default accounts.txt if exists
     await start_all_bots()
     
     print("\n" + "="*50)
     print("✅ SYSTEM FULLY OPERATIONAL")
     print("📋 Features:")
-    print("  ✅ Upload accounts.txt via web panel")
     print("  ✅ Auto-create squad on bot start")
     print("  ✅ Continuous invite spam to targets")
-    print("  ✅ Each bot sends invites one by one (0.1s delay)")
+    print("  ✅ 1 second delay between bots sending invites")
     print("  ✅ Auto-exit and recreate squad")
     print("  ✅ Auto-reset every 20 minutes")
     print("  ✅ Target management from web panel")
     print("  ✅ Real-time bot status with dots")
+    print("  ✅ Upload accounts.txt from web panel")
+    print("  ✅ Restart bots after upload")
     print("="*50)
     
     while True:
