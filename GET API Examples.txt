@@ -1,0 +1,20 @@
+# Full Spam শুরু
+curl -X GET "http://127.0.0.1:8080/api/spam/all/1234567890"
+
+# Squad Spam শুরু
+curl -X GET "http://127.0.0.1:8080/api/spam/squad/1234567890"
+
+# স্পাম বন্ধ
+curl -X GET "http://127.0.0.1:8080/api/stop/1234567890"
+
+# সব স্পাম বন্ধ
+curl -X GET "http://127.0.0.1:8080/api/stop-all"
+
+# স্ট্যাটাস দেখুন
+curl -X GET "http://127.0.0.1:8080/api/status"
+
+# অ্যাকাউন্ট লিস্ট
+curl -X GET "http://127.0.0.1:8080/api/accounts"
+
+# রিসেট করুন
+curl -X GET "http://127.0.0.1:8080/api/reset"

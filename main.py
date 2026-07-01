@@ -1,8 +1,9 @@
 import os, sys, time, json, ssl, socket, threading, asyncio, base64, binascii, re, jwt, pickle, random
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
+from functools import wraps
 
 import requests
 import urllib3
@@ -21,28 +22,38 @@ import xKEys
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ==================== LOGIN CONFIG ====================
+ADMIN_PASSWORD = "MAHIRJOD"
+SECRET_KEY = "mahir_system_secret_key_2024"
+
 # ==================== ফ্লাস্ক অ্যাপ ====================
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# ==================== LOGIN REQUIRED DECORATOR ====================
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated_function
 
 # ==================== গ্লোবাল ভেরিয়েবল ====================
 connected_clients = {}
 connected_clients_lock = threading.Lock()
-active_power_targets = {}
-active_power_lock = threading.Lock()
+active_spam_targets = {}  # target_uid -> {'type': 'full' or 'squad', 'start_time': datetime}
+active_spam_lock = threading.Lock()
 spam_threads = {}
 spam_threads_lock = threading.Lock()
-auto_uids = []      # auto_uid.txt - SMART MONITORED (স্ট্যাটাস দেখে অটো স্প্যাম)
-invite_uids = []    # inv_uid.txt - ACTIVE TARGETS (সরাসরি স্প্যাম)
-auto_spam_active = False
-auto_spam_thread = None
-refresh_timer = None
-target_status_cache = {}
-smart_target_statuses = {}
-smart_monitor_threads = {}
-smart_monitor_lock = threading.Lock()
-target_group_leaders = {}
-active_invite_targets = {}  # inv_uid.txt এর জন্য সক্রিয় টার্গেট
-invite_spam_thread = None
+
+# Auto reset timer
+auto_reset_timer = None
+AUTO_RESET_INTERVAL = 2 * 60 * 60  # 2 hours in seconds
+
+# File paths
+ACCOUNTS_FILE = "accs.txt"
+GROUP_ACCOUNTS_FILE = "group.txt"
 
 C = "\033[96m"
 G = "\033[92m"
@@ -50,9 +61,6 @@ Y = "\033[93m"
 R = "\033[91m"
 RS = "\033[0m"
 BOLD = "\033[1m"
-
-_ID = '4575104506'
-_PW = 'TORIKUL_TORIKUL_E6H3H'
 
 # ==================== ব্যাজ ভ্যালু ====================
 BADGES = {
@@ -71,200 +79,73 @@ GROUP_CONFIGS = {
 }
 
 # ==================== FILE LOADERS ====================
-def load_invite_uids(filename="inv_uid.txt"):
-    """Load UIDs from inv_uid.txt - এগুলো সরাসরি ACTIVE TARGETS হিসেবে স্প্যাম পাবে"""
-    global invite_uids
-    uids = []
+def load_accounts(filename="accs.txt"):
+    """Load accounts from file"""
+    accounts = []
     try:
+        if not os.path.exists(filename):
+            with open(filename, "w") as f:
+                f.write("# Format: UID:PASSWORD\n")
+                f.write("# Example:\n")
+                f.write("# 1234567890:password123\n")
+            return []
+
         with open(filename, "r", encoding="utf-8") as file:
             for line in file:
-                uid = line.strip()
-                if uid and not uid.startswith("#") and uid.isdigit():
-                    uids.append(uid)
-        invite_uids = uids
-        print(f"{G}📦 Loaded {len(invite_uids)} ACTIVE TARGETS from inv_uid.txt{RS}")
-    except FileNotFoundError:
-        print(f"{Y}⚠️ inv_uid.txt not found! Creating...{RS}")
-        with open(filename, "w") as f:
-            f.write("# ACTIVE TARGETS - These UIDs will be spammed directly\n")
-            f.write("# Example:\n")
-            f.write("# 1234567890\n")
-            f.write("# 0987654321\n")
-        invite_uids = []
-    return invite_uids
-
-def save_invite_uids(uids):
-    """Save UIDs to inv_uid.txt"""
-    try:
-        with open("inv_uid.txt", "w", encoding="utf-8") as file:
-            file.write("# ACTIVE TARGETS - These UIDs will be spammed directly\n")
-            file.write("# Example:\n")
-            for uid in uids:
-                file.write(f"{uid}\n")
-        global invite_uids
-        invite_uids = uids
-        # নতুন UIDs যোগ করলে স্প্যাম শুরু করুন
-        if uids and not auto_spam_active:
-            start_invite_targets_spam()
-    except Exception as e:
-        print(f"{R}❌ Failed to save inv_uid.txt: {e}{RS}")
-
-def load_auto_uids(filename="auto_uid.txt"):
-    """Load UIDs from auto_uid.txt - এগুলো SMART MONITORED (স্ট্যাটাস দেখে স্প্যাম)"""
-    global auto_uids
-    uids = []
-    try:
-        with open(filename, "r", encoding="utf-8") as file:
-            for line in file:
-                uid = line.strip()
-                if uid and not uid.startswith("#") and uid.isdigit():
-                    uids.append(uid)
-        auto_uids = uids
-        print(f"{G}📦 Loaded {len(auto_uids)} SMART MONITORED UIDs from auto_uid.txt{RS}")
-    except FileNotFoundError:
-        print(f"{Y}⚠️ auto_uid.txt not found! Creating...{RS}")
-        with open(filename, "w") as f:
-            f.write("# SMART MONITORED UIDs - Status based auto spam\n")
-            f.write("# Example:\n")
-            f.write("# 1234567890\n")
-            f.write("# 0987654321\n")
-        auto_uids = []
-    return auto_uids
-
-def save_auto_uids(uids):
-    """Save UIDs to auto_uid.txt"""
-    try:
-        with open("auto_uid.txt", "w", encoding="utf-8") as file:
-            file.write("# SMART MONITORED UIDs - Status based auto spam\n")
-            file.write("# Example:\n")
-            for uid in uids:
-                file.write(f"{uid}\n")
-    except Exception as e:
-        print(f"{R}❌ Failed to save auto_uid.txt: {e}{RS}")
-
-# ==================== INVITE TARGETS SPAM WORKER ====================
-def invite_targets_spam_worker():
-    """inv_uid.txt এর UID গুলোতে সরাসরি স্প্যাম পাঠানোর জন্য ওয়ার্কার"""
-    global auto_spam_active
-    
-    print(f"\n{G}{'='*60}{RS}")
-    print(f"{G}🎯 ACTIVE TARGETS SPAM STARTED ON {len(invite_uids)} TARGETS:{RS}")
-    for tid in invite_uids:
-        print(f"{G}   ➤ {tid} (ACTIVE TARGET){RS}")
-    print(f"{C}{'='*60}{RS}\n")
-
-    total_requests = 0
-    round_number = 0
-
-    def run_async(coro):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        except:
-            return None
-        finally:
-            loop.close()
-
-    while auto_spam_active:
-        with connected_clients_lock:
-            clients_list = list(connected_clients.values())
-
-        if not clients_list:
-            time.sleep(2)
-            continue
-
-        round_number += 1
-
-        for target_id in invite_uids:
-            for client in clients_list:
-                try:
-                    if hasattr(client, 'CliEnts2') and client.key:
-                        # === 1. রুম স্প্যাম ===
-                        try:
-                            open_pkt = openroom(client.key, client.iv)
-                            if open_pkt:
-                                client.CliEnts2.send(open_pkt)
-                            
-                            spam_pkt = spmroom(client.key, client.iv, target_id)
-                            if spam_pkt:
-                                client.CliEnts2.send(spam_pkt)
-                                total_requests += 1
-                        except:
-                            pass
-
-                        # === 2. গ্রুপ ইনভাইট (3/5/6 প্লেয়ার) ===
-                        for players in [3, 5, 6]:
-                            try:
-                                async def send_invite():
-                                    p1 = await OpEnSq(client.key, client.iv)
-                                    client.CliEnts2.send(p1)
-                                    await asyncio.sleep(0.05)
-                                    p2 = await cHSq(players, target_id, client.key, client.iv)
-                                    client.CliEnts2.send(p2)
-                                    await asyncio.sleep(0.05)
-                                    p3 = await SEnd_InV(players, target_id, client.key, client.iv)
-                                    client.CliEnts2.send(p3)
-                                    total_requests += 1
-                                    await asyncio.sleep(0.05)
-                                    p4 = await ExiT(client.key, client.iv)
-                                    client.CliEnts2.send(p4)
-                                run_async(send_invite())
-                            except:
-                                pass
-
-                        # === 3. ব্যাজ জয়িন ===
-                        for badge_name, badge_value in BADGES.items():
-                            try:
-                                badge_pkt = create_badge_join_packet(client.key, client.iv, target_id, badge_value)
-                                if badge_pkt:
-                                    client.CliEnts2.send(badge_pkt)
-                                    total_requests += 1
-                                    time.sleep(0.03)
-                            except:
-                                pass
-
-                except Exception as e:
-                    print(f"{R}❌ Error: {e}{RS}")
-
-                time.sleep(0.05)
-
-        if round_number % 5 == 0:
-            print(f"{C}{'='*50}{RS}")
-            print(f"{G}📊 ACTIVE TARGETS Round {round_number} Complete{RS}")
-            print(f"{G}📊 Total Requests: {total_requests}{RS}")
-            print(f"{G}🎯 Active Targets: {len(invite_uids)}{RS}")
-            print(f"{G}🤖 Bots Online: {len(clients_list)}{RS}")
-            print(f"{C}{'='*50}{RS}\n")
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    if ":" in line:
+                        parts = line.split(":")
+                        uid = parts[0].strip()
+                        pwd = parts[1].strip()
+                    else:
+                        uid = line.strip()
+                        pwd = ""
+                    
+                    if uid.isdigit():
+                        accounts.append({'id': uid, 'password': pwd})
         
-        time.sleep(0.5)
-
-    print(f"\n{R}🛑 ACTIVE TARGETS SPAM STOPPED{RS}\n")
-
-def start_invite_targets_spam():
-    """inv_uid.txt এর UID গুলোতে স্প্যাম শুরু করুন"""
-    global auto_spam_active, invite_spam_thread
+        print(f"{G}📦 Loaded {len(accounts)} accounts from {filename}{RS}")
+    except Exception as e:
+        print(f"{R}❌ Error loading {filename}: {e}{RS}")
     
-    if not invite_uids:
-        print(f"{Y}⚠️ No active targets in inv_uid.txt{RS}")
-        return False, "No active targets in inv_uid.txt"
-    
-    if invite_spam_thread and invite_spam_thread.is_alive():
-        return False, "Active targets spam already running"
-    
-    auto_spam_active = True
-    invite_spam_thread = Thread(target=invite_targets_spam_worker, daemon=True)
-    invite_spam_thread.start()
-    
-    return True, f"Started spam on {len(invite_uids)} active targets"
+    return accounts
 
-def stop_invite_targets_spam():
-    """inv_uid.txt এর স্প্যাম বন্ধ করুন"""
-    global auto_spam_active
-    auto_spam_active = False
-    return True, "Active targets spam stopped"
+def load_group_accounts(filename="group.txt"):
+    """Load group accounts for squad creation"""
+    accounts = []
+    try:
+        if not os.path.exists(filename):
+            with open(filename, "w") as f:
+                f.write("# Group accounts for squad creation\n")
+                f.write("# Format: UID:PASSWORD\n")
+            return []
 
-# ==================== STATUS CHECKER FUNCTIONS ====================
+        with open(filename, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    if ":" in line:
+                        parts = line.split(":")
+                        uid = parts[0].strip()
+                        pwd = parts[1].strip()
+                    else:
+                        uid = line.strip()
+                        pwd = ""
+                    
+                    if uid.isdigit():
+                        accounts.append({'id': uid, 'password': pwd})
+        
+        print(f"{G}📦 Loaded {len(accounts)} group accounts from {filename}{RS}")
+    except Exception as e:
+        print(f"{R}❌ Error loading {filename}: {e}{RS}")
+    
+    return accounts
+
+ACCOUNTS = load_accounts("accs.txt")
+GROUP_ACCOUNTS = load_group_accounts("group.txt")
+
+# ==================== PACKET CREATION FUNCTIONS ====================
 def create_group_invite_packet(key, iv, target_uid, players=5, region="BD"):
     """Create group invite packet"""
     try:
@@ -325,9 +206,8 @@ def create_group_invite_packet(key, iv, target_uid, players=5, region="BD"):
         return None
 
 def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
-    """Create join request with badge using custom working avatars"""
+    """Create join request with badge"""
     try:
-        # xBunnEr list of working avatar IDs
         avatar_ids = [
             902000028, 902000011, 902000015, 902000013, 902000086,
             902000154, 902000127, 902000207, 902000246, 902000305,
@@ -361,7 +241,7 @@ def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
                 18: 312,
                 19: 46,
                 23: bytes([16, 1, 24, 1]),
-                24: selected_avatar, # এখানে xBunnEr এর অবতার আইডি ব্যবহার করা হয়েছে
+                24: selected_avatar,
                 26: "",
                 28: "",
                 31: {1: 1, 2: badge_value},
@@ -489,712 +369,233 @@ async def ExiT(K, V):
     fields = {1: 7, 2: {1: 0}}
     return await _pk((await _pb(fields)).hex(), '0515', K, V)
 
-# ==================== SMART MONITOR FOR AUTO_UID ====================
-def monitor_target_smart(target_uid):
-    """Smart monitor that automatically starts/stops spam based on target status"""
-    print(f"{C}🧠 SMART MONITOR started for target: {target_uid}{RS}")
-    
-    last_status = None
-    is_currently_spamming = False
-    leader_spam_started = set()
-    
-    while True:
-        with smart_monitor_lock:
-            if target_uid not in smart_monitor_threads:
-                print(f"{Y}📌 Smart monitor stopped for: {target_uid}{RS}")
-                break
-        
-        try:
-            status_info = get_detailed_status(target_uid)
-            current_status = status_info.get('status', 'OFFLINE')
-            is_online = status_info.get('is_online', False)
-            mode = status_info.get('mode', '')
-            squad_owner = status_info.get('squad_owner')
-            
-            should_spam = False
-            spam_reason = ""
-            
-            if not is_online or current_status == 'OFFLINE':
-                spam_reason = "Target is OFFLINE"
-                should_spam = False
-            elif current_status == 'INGAME':
-                spam_reason = f"Target is IN-GAME ({mode})"
-                should_spam = False
-            elif current_status == 'MATCHMAKING':
-                spam_reason = "Target is MATCHMAKING"
-                should_spam = False
-            elif current_status in ['SOLO', 'SOCIAL_ISLAND', 'IN_ROOM']:
-                spam_reason = f"Target is {current_status} - READY TO SPAM"
-                should_spam = True
-            elif current_status == 'INSQUAD':
-                if squad_owner and str(squad_owner) != str(target_uid):
-                    spam_reason = f"Target in squad, leader: {squad_owner}"
-                    should_spam = True
-                    if squad_owner not in leader_spam_started:
-                        print(f"{G}🎯 Starting spam on group leader: {squad_owner}{RS}")
-                        start_multi_spam([squad_owner])
-                        leader_spam_started.add(squad_owner)
-                        target_group_leaders[target_uid] = squad_owner
-                else:
-                    spam_reason = "Target is squad owner - READY TO SPAM"
-                    should_spam = True
-            else:
-                spam_reason = f"Status: {current_status}"
-                should_spam = is_online
-            
-            if should_spam and not is_currently_spamming:
-                print(f"{G}▶️ SMART: Starting spam on {target_uid} - {spam_reason}{RS}")
-                start_multi_spam([target_uid])
-                is_currently_spamming = True
-                
-            elif not should_spam and is_currently_spamming:
-                print(f"{R}⏸️ SMART: Stopping spam on {target_uid} - {spam_reason}{RS}")
-                stop_spam(target_uid)
-                is_currently_spamming = False
-            
-            if current_status != 'INSQUAD' and target_uid in target_group_leaders:
-                old_leader = target_group_leaders[target_uid]
-                print(f"{Y}👋 Target left squad, stopping leader spam: {old_leader}{RS}")
-                stop_spam(old_leader)
-                del target_group_leaders[target_uid]
-                if old_leader in leader_spam_started:
-                    leader_spam_started.discard(old_leader)
-            
-            if last_status != current_status:
-                status_icon = "🟢 ONLINE" if is_online else "⚫ OFFLINE"
-                print(f"\n{BOLD}🧠 SMART MONITOR - UID: {target_uid}")
-                print(f"  Status:     {status_icon}")
-                print(f"  Game Mode:  {current_status}")
-                print(f"  Time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RS}")
-                print(f"{C}Status changed: {last_status} → {current_status}{RS}\n")
-                last_status = current_status
-                
-                with smart_monitor_lock:
-                    smart_target_statuses[target_uid] = current_status
-            
-            if target_uid in target_group_leaders:
-                leader_uid = target_group_leaders[target_uid]
-                leader_status = get_detailed_status(leader_uid)
-                if not leader_status.get('is_online', False):
-                    print(f"{Y}⚠️ Leader {leader_uid} went offline, stopping{RS}")
-                    stop_spam(leader_uid)
-                    
-        except Exception as e:
-            print(f"{R}❌ Smart monitor error for {target_uid}: {e}{RS}")
-        
-        time.sleep(3)
-
-def start_smart_monitor(target_uid):
-    """Start smart monitoring for a target"""
-    with smart_monitor_lock:
-        if target_uid in smart_monitor_threads:
-            return False, f"Already monitoring {target_uid}"
-        
-        thread = Thread(target=monitor_target_smart, args=(target_uid,), daemon=True)
-        smart_monitor_threads[target_uid] = thread
-        thread.start()
-        return True, f"Smart monitoring started for {target_uid}"
-
-def stop_smart_monitor(target_uid):
-    """Stop smart monitoring for a target"""
-    with smart_monitor_lock:
-        if target_uid in smart_monitor_threads:
-            del smart_monitor_threads[target_uid]
-            stop_spam(target_uid)
-            return True, f"Smart monitoring stopped for {target_uid}"
-    return False, f"No monitor found for {target_uid}"
-
-# ==================== STATUS CHECKER SESSION ====================
-_TTL = 6 * 60 * 60
-
-_Hr = {
-    'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)',
-    'Connection': 'Keep-Alive',
-    'Accept-Encoding': 'gzip',
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Expect': '100-continue',
-    'X-Unity-Version': '2018.4.11f1',
-    'X-GA': 'v1 1',
-    'ReleaseVersion': 'OB54',
-}
-
-_cx = {}
-
-def _rdVr(data, pos):
-    n = 0
-    sh = 0
-    while True:
-        b = data[pos]
-        pos += 1
-        n |= (b & 0x7F) << sh
-        sh += 7
-        if not b & 0x80:
-            break
-    return n, pos
-
-def _pbF(data):
-    out = {}
-    pos = 0
-    while pos < len(data):
-        try:
-            tag, pos = _rdVr(data, pos)
-            fn = tag >> 3
-            wt = tag & 0x7
-            if wt == 0:
-                v, pos = _rdVr(data, pos)
-                out[fn] = v
-            elif wt == 2:
-                ln, pos = _rdVr(data, pos)
-                out[fn] = data[pos:pos+ln]
-                pos += ln
-            elif wt == 1:
-                out[fn] = data[pos:pos+8]
-                pos += 8
-            elif wt == 5:
-                out[fn] = data[pos:pos+4]
-                pos += 4
-            else:
-                break
-        except:
-            break
-    return out
-
-async def _vr(n):
-    h = []
-    while True:
-        b = n & 0x7F
-        n >>= 7
-        if n:
-            b |= 0x80
-        h.append(b)
-        if not n:
-            break
-    return bytes(h)
-
-async def _enc(hx, k, v):
-    return AES.new(k, AES.MODE_CBC, v).encrypt(pad(bytes.fromhex(hx), 16)).hex()
-
-async def _hx(n):
-    f = hex(n)[2:]
-    return ('0' + f) if len(f) == 1 else f
-
-async def _var(fn, val):
-    return await _vr((fn << 3) | 0) + await _vr(val)
-
-async def _len(fn, val):
-    e = val.encode() if isinstance(val, str) else val
-    return await _vr((fn << 3) | 2) + await _vr(len(e)) + e
-
-async def _pb(flds):
-    p = bytearray()
-    for f, v in flds.items():
-        if isinstance(v, dict):
-            p.extend(await _len(f, await _pb(v)))
-        elif isinstance(v, int):
-            p.extend(await _var(f, v))
-        elif isinstance(v, (str, bytes)):
-            p.extend(await _len(f, v))
-    return p
-
-async def _pk(px, n, k, v):
-    e = await _enc(px, k, v)
-    _ = await _hx(len(e) // 2)
-    m = {2: '000000', 3: '00000', 4: '0000', 5: '000'}
-    return bytes.fromhex(n + m.get(len(_), '000000') + _ + e)
-
-async def _fix(rs):
-    d = {}
-    for r in rs:
-        fd = {'wire_type': r.wire_type}
-        if r.wire_type in ('varint', 'string', 'bytes'):
-            fd['data'] = r.data
-        elif r.wire_type == 'length_delimited':
-            fd['data'] = await _fix(r.data.results)
-        d[r.field] = fd
-    return d
-
-async def _parse(hx):
+# ==================== SPAM WORKER FUNCTIONS ====================
+def run_async(coro):
     try:
-        from protobuf_decoder.protobuf_decoder import Parser
-        return json.dumps(await _fix(Parser().parse(hx)))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
     except:
         return None
-
-async def _uidEnc(uid):
-    return (await _pb({1: int(uid)})).hex()[2:]
-
-async def _stPkt(uid, k, v):
-    ue = await _uidEnc(int(uid))
-    return await _pk(f"080112090A05{ue}1005", '0F15', k, v)
-
-async def _rmPkt(ruid, k, v):
-    return await _pk((await _pb({1: 1, 2: {1: ruid, 3: {}, 4: 1, 6: 'en'}})).hex(), '0E15', k, v)
-
-def _tdiff(ts):
-    d = int((datetime.now() - datetime.fromtimestamp(ts)).total_seconds())
-    return f"{(abs(d) % 3600) // 60:02}:{abs(d) % 60:02}"
-
-def _pStatus(pkt):
-    data = json.loads(pkt)
-    if '5' not in data or 'data' not in data['5']:
-        return {'status': 'OFFLINE'}
-    jd = data['5']['data']
-    if '1' not in jd or 'data' not in jd['1']:
-        return {'status': 'OFFLINE'}
-    d = jd['1']['data']
-    if '3' not in d or 'data' not in d['3']:
-        return {'status': 'OFFLINE'}
-    st = d['3']['data']
-    gc = d.get('9', {}).get('data', 0)
-    cm = d.get('10', {}).get('data', 0) + 1 if '10' in d else 0
-    go = d.get('8', {}).get('data', 0)
-    tg = d.get('4', {}).get('data', 0)
-    m5 = d.get('5', {}).get('data')
-    m6 = d.get('6', {}).get('data')
-    mn = sc = 0
-    if tg:
-        a, b = _tdiff(tg).split(':')
-        mn = int(a)
-        sc = int(b)
-    
-    if st == 4:
-        return {
-            'status': 'IN_ROOM',
-            'room_uid': d.get('15', {}).get('data'),
-            'players': f"{d.get('17',{}).get('data',0)}/{d.get('18',{}).get('data',0)}",
-            'room_owner': d.get('1', {}).get('data')
-        }
-    
-    base = {
-        1: 'SOLO',
-        2: 'INSQUAD',
-        3: 'INGAME',
-        5: 'INGAME',
-        7: 'MATCHMAKING',
-        6: 'SOCIAL_ISLAND'
-    }.get(st, 'OFFLINE')
-    
-    mode = None
-    f14 = d.get('14', {}).get('data')
-    if f14 == 1:
-        mode = 'TRAINING'
-    elif f14 == 2:
-        mode = 'SOCIAL_ISLAND'
-    
-    mm = {
-        (2, 1): 'BR_RANK', (5, 23): 'TRAINING', (6, 15): 'CS_RANK',
-        (1, 43): 'LONE_WOLF', (1, 1): 'BERMUDA', (1, 15): 'CLASH_SQUAD',
-        (1, 29): 'CONVOY_CRUNCH', (1, 61): 'FREE_FOR_ALL'
-    }
-    if (m5, m6) in mm:
-        mode = mm[(m5, m6)]
-    
-    res = {'status': base, 'mode': mode}
-    if base == 'INSQUAD':
-        res['squad_owner'] = go
-        res['squad_size'] = f"{gc}/{cm}" if gc else None
-    if base in ('INGAME', 'INSQUAD') and tg:
-        res['time_playing'] = f"{mn}m {sc}s"
-    return res
-
-def _pRoom(pkt):
-    data = json.loads(pkt)
-    rd = data['5']['data']['1']['data']
-    mm = {
-        1: 'BERMUDA', 201: 'BATTLE_CAGE', 15: 'CLASH_SQUAD', 43: 'LONE_WOLF',
-        3: 'RUSH_HOUR', 27: 'BOMB_SQUAD_5V5', 24: 'DEATH_MATCH'
-    }
-    return {
-        'room_id': int(rd['1']['data']),
-        'room_name': rd['2']['data'],
-        'owner_uid': int(rd['37']['data']['1']['data']),
-        'mode': mm.get(rd.get('4', {}).get('data'), 'UNKNOWN'),
-        'players': f"{rd.get('6',{}).get('data',0)}/{rd.get('7',{}).get('data',0)}",
-        'spectators': rd.get('9', {}).get('data', 0),
-        'emulator': bool(rd.get('17', {}).get('data', 1)),
-    }
-
-async def _rAll(reader, timeout=5):
-    buf = b''
-    while True:
-        try:
-            chunk = await asyncio.wait_for(reader.read(65536), timeout=timeout)
-        except asyncio.TimeoutError:
-            break
-        if not chunk:
-            break
-        buf += chunk
-    return buf
-
-async def _scan(buf, k, v):
-    h = buf.hex()
-    for mk, pt in [('0f00', '0f'), ('0e00', '0e')]:
-        i = h.find(mk)
-        if i != -1 and i % 2 == 0:
-            return pt, h[i + 10:]
-    if len(buf) > 5:
-        pl = buf[5:]
-        pl = pl[:len(pl) - (len(pl) % 16)]
-        if len(pl) >= 16:
-            try:
-                dc = unpad(AES.new(k, AES.MODE_CBC, v).decrypt(pl), 16).hex()
-                for mk, pt in [('0f00', '0f'), ('0e00', '0e')]:
-                    i = dc.find(mk)
-                    if i != -1 and i % 2 == 0:
-                        return pt, dc[i + 10:]
-            except:
-                pass
-    return None, None
-
-async def _mkLogin(oid, atk):
-    return await _pb({
-        3: str(datetime.now())[:-7], 4: 'free fire', 5: 1, 7: '1.126.7',
-        8: 'Android OS 9 / API-28 (PQ3B.190801.10101846/G9650ZHU2ARC6)',
-        9: 'Handheld', 10: 'Verizon', 11: 'WIFI', 12: 1920, 13: 1080,
-        14: '280', 15: 'ARM64 FP ASIMD AES VMH | 2865 | 4', 16: 3003,
-        17: 'Adreno (TM) 640', 18: 'OpenGL ES 3.1 v1.46',
-        19: 'Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57',
-        20: '223.191.51.89', 21: 'en', 22: oid, 23: '4', 24: 'Handheld',
-        25: {6: 55, 8: 81},
-        29: atk, 30: 1, 73: 3, 78: 3, 79: 2, 81: '64',
-        93: 'android', 97: 1, 98: 1, 99: '4', 100: '4',
-    })
-
-
-async def _auth(uid, tok, ts, k, v):
-    uh = hex(uid)[2:]
-    hd = {9: '0000000', 8: '00000000', 10: '000000', 7: '000000000'}.get(len(uh), '0000000')
-    e = await _enc(tok.encode().hex(), k, v)
-    el = await _hx(len(e) // 2)
-    return f"0115{hd}{uh}{await _hx(ts)}00000{el}{e}"
-
-async def _login():
-    sx = ssl.create_default_context()
-    sx.check_hostname = False
-    sx.verify_mode = ssl.CERT_NONE
-
-    async with aiohttp.ClientSession() as s:
-        async with s.post('https://100067.connect.garena.com/oauth/guest/token/grant',
-                         headers=_Hr,
-                         data={
-                             'uid': _ID,
-                             'password': _PW,
-                             'response_type': 'token',
-                             'client_type': '2',
-                             'client_secret': '2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3',
-                             'client_id': '100067'
-                         }, ssl=sx) as r:
-            if r.status != 200:
-                raise Exception(f"OAuth {r.status}")
-            d = await r.json()
-            oid = d['open_id']
-            atk = d['access_token']
-
-    raw = await _mkLogin(oid, atk)
-    ep = AES.new(b'Yg&tc%DEuh6%Zc^8', AES.MODE_CBC, b'6oyZDr22E3ychjM%').encrypt(pad(raw, 16))
-
-    async with aiohttp.ClientSession() as s:
-        async with s.post('https://loginbp.ggpolarbear.com/MajorLogin', data=ep, headers=_Hr, ssl=sx) as r:
-            if r.status != 200:
-                raise Exception(f"MajorLogin {r.status}")
-            mr = await r.read()
-
-    mlr = _pbF(mr)
-    tok = mlr[8].decode()
-    tgt = mlr[1]
-    k = mlr[22]
-    v = mlr[23]
-    ts = mlr[21]
-    url = mlr[10].decode()
-
-    h2 = {**_Hr, 'Authorization': f'Bearer {tok}'}
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{url}/GetLoginData", data=ep, headers=h2, ssl=sx) as r:
-            if r.status != 200:
-                raise Exception(f"GetLoginData {r.status}")
-            lr = await r.read()
-
-    ld = _pbF(lr)
-    ip, port = ld[14].decode().split(':')
-    at = await _auth(int(tgt), tok, int(ts), k, v)
-    return {
-        'account_id': tgt,
-        'token': tok,
-        'key': k,
-        'iv': v,
-        'ip': ip,
-        'port': int(port),
-        'auth': at,
-        'exp': time.time() + _TTL
-    }
-
-def _sess():
-    global _cx
-    if 's' in _cx and _cx['s'] and time.time() < _cx['s']['exp']:
-        return _cx['s']
-    _cx['s'] = asyncio.run(_login())
-    return _cx['s']
-
-async def _query(uid, sx):
-    rd, wr = await asyncio.open_connection(sx['ip'], sx['port'])
-    try:
-        wr.write(bytes.fromhex(sx['auth']))
-        await wr.drain()
-        await _rAll(rd, timeout=3)
-        pkt = await _stPkt(uid, sx['key'], sx['iv'])
-        wr.write(pkt)
-        await wr.drain()
-        buf = await _rAll(rd, timeout=5)
-        if not buf:
-            return {'status': 'NO_RESPONSE'}
-        pt, pl = await _scan(buf, sx['key'], sx['iv'])
-        if pt == '0f':
-            raw = await _parse(pl)
-            if not raw:
-                return {'status': 'PARSE_ERROR'}
-            info = _pStatus(raw)
-            if info.get('status') == 'IN_ROOM':
-                wr.write(await _rmPkt(int(info['room_uid']), sx['key'], sx['iv']))
-                await wr.drain()
-                rb = await _rAll(rd, timeout=5)
-                if rb:
-                    rt, rp = await _scan(rb, sx['key'], sx['iv'])
-                    if rt == '0e':
-                        rr = await _parse(rp)
-                        if rr:
-                            info['room_info'] = _pRoom(rr)
-            return info
-        elif pt == '0e':
-            raw = await _parse(pl)
-            return _pRoom(raw) if raw else {'status': 'PARSE_ERROR'}
-        return {'status': 'UNKNOWN', 'buf': buf.hex()[:120]}
     finally:
-        wr.close()
+        loop.close()
+
+def send_full_spam(client, target_uid):
+    """Send full spam: room + squad + badge + group invites"""
+    total_sent = 0
+    
+    try:
+        if not hasattr(client, 'CliEnts2') or not client.key:
+            return 0
+        
+        # === 1. Room Spam ===
         try:
-            await wr.wait_closed()
+            open_pkt = openroom(client.key, client.iv)
+            if open_pkt:
+                client.CliEnts2.send(open_pkt)
+            
+            spam_pkt = spmroom(client.key, client.iv, target_uid)
+            if spam_pkt:
+                client.CliEnts2.send(spam_pkt)
+                total_sent += 1
         except:
             pass
 
-def get_detailed_status(uid):
-    """Get detailed status information"""
-    try:
-        session = _sess()
-        result = asyncio.run(_query(int(uid), session))
-        
-        detailed = {
-            'uid': str(uid),
-            'timestamp': datetime.now().isoformat(),
-            'is_online': result.get('status', 'OFFLINE') not in ['OFFLINE', 'ERROR', 'NO_RESPONSE'],
-            'status': result.get('status', 'UNKNOWN'),
-            'mode': result.get('mode', 'N/A'),
-        }
-        
-        if result.get('status') == 'INSQUAD':
-            detailed['squad_owner'] = result.get('squad_owner')
-            detailed['squad_size'] = result.get('squad_size')
-        elif result.get('status') == 'IN_ROOM':
-            detailed['room_owner'] = result.get('room_owner')
-            detailed['players'] = result.get('players')
-            if result.get('room_info'):
-                detailed['room_details'] = result['room_info']
-        
-        if result.get('time_playing'):
-            detailed['time_playing'] = result['time_playing']
-        
-        return detailed
-    except Exception as e:
-        return {'status': 'ERROR', 'error': str(e), 'uid': str(uid)}
+        # === 2. Squad Invite (5 player) ===
+        try:
+            async def send_squad():
+                p1 = await OpEnSq(client.key, client.iv, "BD")
+                client.CliEnts2.send(p1)
+                await asyncio.sleep(0.05)
+                p2 = await cHSq(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p2)
+                await asyncio.sleep(0.05)
+                p3 = await SEnd_InV(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p3)
+                await asyncio.sleep(0.05)
+                p4 = await ExiT(client.key, client.iv)
+                client.CliEnts2.send(p4)
+            run_async(send_squad())
+            total_sent += 1
+        except:
+            pass
 
-# ==================== ENHANCED SPAM WORKER (MULTI-TARGET) ====================
-def spam_worker_multi(targets_list):
-    """একাধিক টার্গেটে একসাথে স্প্যাম করার জন্য ওয়ার্কার"""
+        # === 3. Badge Join ===
+        for badge_name, badge_value in BADGES.items():
+            try:
+                badge_pkt = create_badge_join_packet(client.key, client.iv, target_uid, badge_value)
+                if badge_pkt:
+                    client.CliEnts2.send(badge_pkt)
+                    total_sent += 1
+                    time.sleep(0.03)
+            except:
+                pass
+
+        # === 4. Group Invites (3, 5, 6 player) ===
+        for players in [3, 5, 6]:
+            try:
+                group_pkt = create_group_invite_packet(client.key, client.iv, target_uid, players)
+                if group_pkt:
+                    client.CliEnts2.send(group_pkt)
+                    total_sent += 1
+                    time.sleep(0.03)
+            except:
+                pass
+                
+    except Exception as e:
+        print(f"{R}❌ Full spam error: {e}{RS}")
+    
+    return total_sent
+
+def send_squad_spam(client, target_uid):
+    """Send only squad spam (group invites)"""
+    total_sent = 0
+    
+    try:
+        if not hasattr(client, 'CliEnts2') or not client.key:
+            return 0
+        
+        # === Squad Invite (5 player) ===
+        try:
+            async def send_squad():
+                p1 = await OpEnSq(client.key, client.iv, "BD")
+                client.CliEnts2.send(p1)
+                await asyncio.sleep(0.05)
+                p2 = await cHSq(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p2)
+                await asyncio.sleep(0.05)
+                p3 = await SEnd_InV(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p3)
+                await asyncio.sleep(0.05)
+                p4 = await ExiT(client.key, client.iv)
+                client.CliEnts2.send(p4)
+            run_async(send_squad())
+            total_sent += 1
+        except:
+            pass
+
+        # === Group Invites (3, 6 player) ===
+        for players in [3, 6]:
+            try:
+                group_pkt = create_group_invite_packet(client.key, client.iv, target_uid, players)
+                if group_pkt:
+                    client.CliEnts2.send(group_pkt)
+                    total_sent += 1
+                    time.sleep(0.03)
+            except:
+                pass
+                
+    except Exception as e:
+        print(f"{R}❌ Squad spam error: {e}{RS}")
+    
+    return total_sent
+
+def spam_worker(target_uid, spam_type='full'):
+    """Main spam worker for a target"""
     print(f"\n{G}{'='*60}{RS}")
-    print(f"{G}🎯 MULTI-TARGET SPAM STARTED ON {len(targets_list)} TARGETS:{RS}")
-    for tid in targets_list:
-        print(f"{G}   ➤ {tid}{RS}")
+    print(f"{G}🎯 SPAM STARTED ON {target_uid} (Type: {spam_type}){RS}")
     print(f"{C}{'='*60}{RS}\n")
 
     total_requests = 0
     round_number = 0
 
-    def run_async(coro):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        except:
-            return None
-        finally:
-            loop.close()
-
     while True:
-        global auto_spam_active
-        if not auto_spam_active:
-            break
-
-        with active_power_lock:
-            current_targets = list(active_power_targets.keys())
-            if not current_targets:
+        with active_spam_lock:
+            if target_uid not in active_spam_targets:
                 break
 
         with connected_clients_lock:
             clients_list = list(connected_clients.values())
+            
+        # Also use group accounts for squad spam
+        group_clients = []
+        for acc in GROUP_ACCOUNTS:
+            if acc['id'] in connected_clients:
+                group_clients.append(connected_clients[acc['id']])
+        
+        all_clients = clients_list + group_clients
 
-        if not clients_list:
+        if not all_clients:
             time.sleep(2)
             continue
 
         round_number += 1
 
-        for target_id in current_targets:
-            for client in clients_list:
-                with active_power_lock:
-                    if target_id not in active_power_targets:
-                        break
+        for client in all_clients:
+            with active_spam_lock:
+                if target_uid not in active_spam_targets:
+                    break
 
-                try:
-                    if hasattr(client, 'CliEnts2') and client.key:
-                        # === 1. রুম স্প্যাম ===
-                        try:
-                            open_pkt = openroom(client.key, client.iv)
-                            if open_pkt:
-                                client.CliEnts2.send(open_pkt)
-                            
-                            spam_pkt = spmroom(client.key, client.iv, target_id)
-                            if spam_pkt:
-                                client.CliEnts2.send(spam_pkt)
-                                total_requests += 1
-                        except:
-                            pass
+            try:
+                if spam_type == 'full':
+                    total_requests += send_full_spam(client, target_uid)
+                else:
+                    total_requests += send_squad_spam(client, target_uid)
+            except Exception as e:
+                print(f"{R}❌ Spam error: {e}{RS}")
 
-                        # === 2. গ্রুপ ইনভাইট (5 প্লেয়ার) ===
-                        try:
-                            async def send_invite_5():
-                                p1 = await OpEnSq(client.key, client.iv)
-                                client.CliEnts2.send(p1)
-                                await asyncio.sleep(0.05)
-                                p2 = await cHSq(5, target_id, client.key, client.iv)
-                                client.CliEnts2.send(p2)
-                                await asyncio.sleep(0.05)
-                                p3 = await SEnd_InV(5, target_id, client.key, client.iv)
-                                client.CliEnts2.send(p3)
-                                total_requests += 1
-                                await asyncio.sleep(0.05)
-                                p4 = await ExiT(client.key, client.iv)
-                                client.CliEnts2.send(p4)
-                            run_async(send_invite_5())
-                        except:
-                            pass
+            time.sleep(0.05)
 
-                        # === 3. ব্যাজ জয়িন ===
-                        for badge_name, badge_value in BADGES.items():
-                            try:
-                                badge_pkt = create_badge_join_packet(client.key, client.iv, target_id, badge_value)
-                                if badge_pkt:
-                                    client.CliEnts2.send(badge_pkt)
-                                    total_requests += 1
-                                    time.sleep(0.03)
-                            except:
-                                pass
-
-                        # === 4. 3 প্লেয়ার গ্রুপ ইনভাইট ===
-                        try:
-                            group_pkt_3 = create_group_invite_packet(client.key, client.iv, target_id, 3)
-                            if group_pkt_3:
-                                client.CliEnts2.send(group_pkt_3)
-                                total_requests += 1
-                                time.sleep(0.03)
-                        except:
-                            pass
-
-                        # === 5. 6 প্লেয়ার গ্রুপ ইনভাইট ===
-                        try:
-                            group_pkt_6 = create_group_invite_packet(client.key, client.iv, target_id, 6)
-                            if group_pkt_6:
-                                client.CliEnts2.send(group_pkt_6)
-                                total_requests += 1
-                                time.sleep(0.03)
-                        except:
-                            pass
-
-                except Exception as e:
-                    print(f"{R}❌ Error: {e}{RS}")
-
-                time.sleep(0.05)
-
-        if round_number % 5 == 0:
+        if round_number % 10 == 0:
             print(f"{C}{'='*50}{RS}")
             print(f"{G}📊 Round {round_number} Complete{RS}")
             print(f"{G}📊 Total Requests: {total_requests}{RS}")
-            print(f"{G}🎯 Active Targets: {len(current_targets)}{RS}")
-            print(f"{G}🤖 Bots Online: {len(clients_list)}{RS}")
+            print(f"{G}🎯 Target: {target_uid}{RS}")
+            print(f"{G}🤖 Bots: {len(all_clients)}{RS}")
             print(f"{C}{'='*50}{RS}\n")
         
         time.sleep(0.5)
 
     with spam_threads_lock:
-        for tid in targets_list:
-            if tid in spam_threads:
-                del spam_threads[tid]
+        if target_uid in spam_threads:
+            del spam_threads[target_uid]
 
-    print(f"\n{R}🛑 MULTI-SPAM STOPPED ON {len(targets_list)} TARGETS{RS}\n")
+    print(f"\n{R}🛑 SPAM STOPPED ON {target_uid}{RS}\n")
 
-def start_multi_spam(targets_list):
-    """একাধিক টার্গেটে স্প্যাম শুরু করুন"""
-    global auto_spam_active
+def start_spam(target_uid, spam_type='full'):
+    """Start spam on a target"""
+    with active_spam_lock:
+        if target_uid in active_spam_targets:
+            return False, f"Already spamming {target_uid}"
+        
+        active_spam_targets[target_uid] = {
+            'type': spam_type,
+            'start_time': datetime.now()
+        }
     
-    if isinstance(targets_list, str):
-        targets_list = [targets_list]
+    thread = Thread(target=spam_worker, args=(target_uid, spam_type), daemon=True)
+    with spam_threads_lock:
+        spam_threads[target_uid] = thread
+    thread.start()
     
-    new_targets = []
-    with active_power_lock:
-        for target in targets_list:
-            if target not in active_power_targets:
-                active_power_targets[target] = {
-                    'active': True,
-                    'start_time': datetime.now()
-                }
-                new_targets.append(target)
-    
-    if new_targets:
-        auto_spam_active = True
-        thread = Thread(target=spam_worker_multi, args=(new_targets,), daemon=True)
-        with spam_threads_lock:
-            for tid in new_targets:
-                spam_threads[tid] = thread
-        thread.start()
-        return True, f"Started spam on {len(new_targets)} targets: {', '.join(new_targets)}"
-    return False, "No new targets to start"
+    return True, f"Started {spam_type} spam on {target_uid}"
 
-def stop_spam(target_id):
-    """একটি নির্দিষ্ট টার্গেটের স্প্যাম বন্ধ করুন"""
-    with active_power_lock:
-        if target_id in active_power_targets:
-            del active_power_targets[target_id]
-            return True, f"Spam stopped on: {target_id}"
-        return False, f"No active spam on: {target_id}"
+def stop_spam(target_uid):
+    """Stop spam on a target"""
+    with active_spam_lock:
+        if target_uid in active_spam_targets:
+            del active_spam_targets[target_uid]
+            return True, f"Stopped spam on {target_uid}"
+    return False, f"No spam found for {target_uid}"
 
 def stop_all_spam():
-    """সব স্প্যাম বন্ধ করুন"""
-    global auto_spam_active
-    auto_spam_active = False
-    with active_power_lock:
-        targets = list(active_power_targets.keys())
+    """Stop all spam"""
+    with active_spam_lock:
+        targets = list(active_spam_targets.keys())
         for target in targets:
-            del active_power_targets[target]
+            del active_spam_targets[target]
     return True, f"Stopped all spam ({len(targets)} targets)"
 
-def get_status():
-    """বর্তমান স্প্যাম স্ট্যাটাস পাওয়া"""
-    with active_power_lock:
-        active_targets = list(active_power_targets.keys())
-        targets_info = []
-        for target in active_targets:
-            info = active_power_targets[target]
+def get_spam_status():
+    """Get current spam status"""
+    with active_spam_lock:
+        active_targets = []
+        for target, info in active_spam_targets.items():
             start_time = info.get('start_time')
             elapsed = (datetime.now() - start_time).total_seconds() if start_time else 0
-            targets_info.append({
+            active_targets.append({
                 'uid': target,
+                'type': info.get('type', 'full'),
                 'elapsed_minutes': int(elapsed / 60)
             })
     
@@ -1202,145 +603,52 @@ def get_status():
         accounts_count = len(connected_clients)
         accounts_list = list(connected_clients.keys())
     
-    with smart_monitor_lock:
-        monitored_targets = [
-            {'uid': uid, 'status': smart_target_statuses.get(uid, 'CHECKING...')} 
-            for uid in smart_monitor_threads.keys()
-        ]
-    
     return {
-        'active_targets': targets_info,
+        'active_targets': active_targets,
         'active_count': len(active_targets),
         'accounts_count': accounts_count,
-        'accounts_list': accounts_list[:50],
-        'auto_uids': auto_uids,
-        'invite_uids': invite_uids,
-        'auto_active': auto_spam_active,
-        'smart_monitored': monitored_targets
+        'accounts_list': accounts_list[:50]
     }
 
-# ==================== AUTO REFRESH ====================
-def auto_refresh_and_restart():
-    """প্রতি ৭ মিনিটে রিফ্রেশ - কিন্তু ACTIVE TARGETS অফ হবে না"""
-    global auto_spam_active, refresh_timer
+# ==================== AUTO RESET ====================
+def auto_reset_spam():
+    """Auto reset all spam every 2 hours"""
+    global auto_reset_timer
     
     print(f"\n{Y}{'='*50}{RS}")
-    print(f"{Y}🔄 AUTO REFRESH INITIATED (KEEPING ACTIVE TARGETS){RS}")
+    print(f"{Y}🔄 AUTO RESET INITIATED (Every 2 Hours){RS}")
     print(f"{Y}{'='*50}{RS}\n")
     
-    # আগে এখানে stop_all_spam() ছিল, যা এখন সরিয়ে দেওয়া হয়েছে।
-    # এর ফলে বর্তমানে যা চলছে তা বন্ধ হবে না।
-
-    # ফাইল থেকে নতুন UID গুলো লোড করা (যদি আপনি ফাইলে নতুন কিছু লিখে থাকেন)
-    load_auto_uids()
-    load_invite_uids()
-    
-    # SMART MONITORED (auto_uid.txt) - শুধুমাত্র নতুন UID গুলো যোগ করা হবে
-    if auto_uids:
-        print(f"{G}🧠 Checking for new SMART monitor targets...{RS}")
-        for uid in auto_uids:
-            with smart_monitor_lock:
-                if uid not in smart_monitor_threads:
-                    start_smart_monitor(uid)
-    
-    # ACTIVE TARGETS (inv_uid.txt) - যদি স্প্যাম থ্রেড বন্ধ থাকে তবেই চালু করবে
-    if invite_uids:
-        if not invite_spam_thread or not invite_spam_thread.is_alive():
-            print(f"{G}🎯 Starting ACTIVE TARGETS worker...{RS}")
-            start_invite_targets_spam()
-        else:
-            print(f"{G}✅ ACTIVE TARGETS worker is already running.{RS}")
-    
-    # টাইমার রিসেট করা
-    if refresh_timer:
-        refresh_timer.cancel()
-    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
-    refresh_timer.daemon = True
-    refresh_timer.start()
-    
-    print(f"{G}✅ Refresh Complete. Next check in 7 minutes.{RS}\n")
-
-def start_auto_refresh():
-    global refresh_timer
-    if refresh_timer:
-        refresh_timer.cancel()
-    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
-    refresh_timer.daemon = True
-    refresh_timer.start()
-    print(f"{G}⏰ Auto-refresh timer started (every 7 minutes){RS}")
-
-def start_auto_spam():
-    """অটো স্প্যাম শুরু করুন (auto_uid.txt স্মার্ট মনিটর + inv_uid.txt সরাসরি স্প্যাম)"""
-    global auto_spam_active
-    
-    if auto_spam_active:
-        return False, "Auto spam already active"
-    
-    auto_spam_active = True
-    
-    # SMART MONITORED (auto_uid.txt)
-    if auto_uids:
-        for uid in auto_uids:
-            start_smart_monitor(uid)
-        print(f"{G}🧠 Started SMART monitors on {len(auto_uids)} UIDs{RS}")
-    
-    # ACTIVE TARGETS (inv_uid.txt)
-    if invite_uids:
-        start_invite_targets_spam()
-        print(f"{G}🎯 Started ACTIVE TARGETS spam on {len(invite_uids)} UIDs{RS}")
-    
-    return True, f"Auto spam started (Smart: {len(auto_uids)}, Active: {len(invite_uids)})"
-
-def stop_auto_spam():
-    """অটো স্প্যাম বন্ধ করুন"""
-    global auto_spam_active
-    auto_spam_active = False
-    
-    # স্মার্ট মনিটর বন্ধ
-    with smart_monitor_lock:
-        monitors = list(smart_monitor_threads.keys())
-        for uid in monitors:
-            del smart_monitor_threads[uid]
-    
-    # একটিভ টার্গেট স্প্যাম বন্ধ
-    stop_invite_targets_spam()
+    # Stop all spam
     stop_all_spam()
     
-    return True, "Auto spam stopped"
-
-# ==================== ACCOUNTS ====================
-ACCOUNTS = []
-
-def load_accounts_from_file(filename="accs.txt"):
-    loaded_accounts = []
-    try:
-        if not os.path.exists(filename):
-            with open(filename, "w") as f:
-                f.write(f"# Format: UID:PASSWORD\n")
-            return []
-
-        with open(filename, "r", encoding="utf-8") as file:
-            for line in file:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    if ":" in line:
-                        parts = line.split(":")
-                        uid = parts[0].strip()
-                        pwd = parts[1].strip()
-                    else:
-                        uid = line.strip()
-                        pwd = ""
-                    
-                    if uid.isdigit():
-                        loaded_accounts.append({'id': uid, 'password': pwd})
-        
-        print(f"{G}📦 Loaded {len(loaded_accounts)} accounts from {filename}{RS}")
-    except Exception as e:
-        print(f"{R}❌ Error loading {filename}: {e}{RS}")
+    # Reload accounts
+    global ACCOUNTS, GROUP_ACCOUNTS
+    ACCOUNTS = load_accounts("accs.txt")
+    GROUP_ACCOUNTS = load_group_accounts("group.txt")
     
-    return loaded_accounts
+    print(f"{G}✅ Auto reset complete. Accounts reloaded.{RS}\n")
+    
+    # Schedule next reset
+    if auto_reset_timer:
+        auto_reset_timer.cancel()
+    auto_reset_timer = threading.Timer(AUTO_RESET_INTERVAL, auto_reset_spam)
+    auto_reset_timer.daemon = True
+    auto_reset_timer.start()
 
-ACCOUNTS = load_accounts_from_file("accs.txt")
+def start_auto_reset():
+    global auto_reset_timer
+    if auto_reset_timer:
+        auto_reset_timer.cancel()
+    auto_reset_timer = threading.Timer(AUTO_RESET_INTERVAL, auto_reset_spam)
+    auto_reset_timer.daemon = True
+    auto_reset_timer.start()
+    print(f"{G}⏰ Auto-reset timer started (every {AUTO_RESET_INTERVAL//3600} hours){RS}")
+
+def trigger_manual_reset():
+    """Manually trigger auto reset via API"""
+    auto_reset_spam()
+    return True, "Manual reset triggered"
 
 # ==================== FF CLIENT ====================
 class FF_CLient():
@@ -1485,12 +793,11 @@ class FF_CLient():
         }
 
         try:
-            # --- প্রোটোবাফ ডাটা তৈরি ---
             major_login = MajoRLoGinrEq_pb2.MajorLogin()
             major_login.event_time = str(datetime.now())[:-7]
             major_login.game_name = "free fire"
             major_login.platform_id = 2
-            major_login.client_version = "1.126.7" # এখানে আপনার ভার্সনটি দিন
+            major_login.client_version = "1.126.7"
             major_login.client_version_code = "2024010012"
             major_login.system_software = "Android OS 11 / API-30 (RQ3A.210805.001)"
             major_login.system_hardware = "Handheld"
@@ -1527,9 +834,9 @@ class FF_CLient():
             major_login.internal_storage_total = 110731
             major_login.internal_storage_available = random.randint(18000, 32000)
             major_login.game_disk_storage_total = 26628
-            major_login.game_disk_storage_available = random.randint(18000, 25000)
+            major_login.game_disk_storage_available = random.randint(18000, 28080)
             major_login.external_sdcard_total_storage = 119234
-            major_login.external_sdcard_avail_storage = random.randint(25000, 60000)
+            major_login.external_sdcard_avail_storage = random.randint(28080, 60000)
             major_login.library_path = "/data/app/~~random/base.apk"
             major_login.library_token = "hash|base.apk"
             major_login.client_using_version = "7428b253defc164018c604a1ebbfebdf"
@@ -1543,7 +850,6 @@ class FF_CLient():
             major_login.cpu_architecture = "64"
             major_login.android_engine_init_flag = 110009
 
-            # সিরিয়ালাইজ এবং এনক্রিপশন
             raw_data = major_login.SerializeToString()
             key = b'Yg&tc%DEuh6%Zc^8'
             iv = b'6oyZDr22E3ychjM%'
@@ -1555,12 +861,10 @@ class FF_CLient():
             time.sleep(5)
             return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
 
-        # সার্ভারে রিকোয়েস্ট পাঠানো
         self.ResPonse = requests.post(self.UrL, headers=self.HeadErs, data=self.PaYload, verify=False)        
         
         if self.ResPonse.status_code == 200:
             try:
-                # রেসপন্স ডিকোড করা
                 self.BesTo_data = json.loads(DeCode_PackEt(self.ResPonse.content.hex()))
                 self.JwT_ToKen = self.BesTo_data['8']['data']           
                 self.combined_timestamp, self.key, self.iv = self.GeT_Key_Iv(self.ResPonse.content)
@@ -1641,462 +945,296 @@ def run_accounts():
         Thread(target=start_account, args=(acc,), daemon=True).start()
         time.sleep(0.2)
 
+def run_group_accounts():
+    for acc in GROUP_ACCOUNTS:
+        Thread(target=start_account, args=(acc,), daemon=True).start()
+        time.sleep(0.2)
+
 # ==================== FLASK ROUTES ====================
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    if request.method == 'POST':
+        password = request.form.get('password', '')
+        if password == ADMIN_PASSWORD:
+            session['logged_in'] = True
+            return redirect(url_for('index'))
+        return render_template_string(LOGIN_TEMPLATE, error='Invalid Password!')
+    return render_template_string(LOGIN_TEMPLATE, error=None)
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login_page'))
+
 @app.route('/')
+@login_required
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-# ==================== NORMAL SPAM GET API ====================
-@app.route('/api/normal', methods=['GET'])
-def api_normal_get_control():
-    """
-    Get API for Normal Spam Control
-    Usage:
-    - ON:  /api/normal?action=on&uid=12345678,98765432
-    - OFF: /api/normal?action=off&uid=12345678
-    - OFF ALL: /api/normal?action=off
-    """
-    action = request.args.get('action', '').lower()
-    target_input = request.args.get('uid', '').strip()
+# ==================== API ROUTES (GET) ====================
 
-    if action == 'on':
-        if not target_input:
-            return jsonify({'success': False, 'message': 'Target UID(s) required!'}), 400
-        
-        # কমা বা স্পেস দিয়ে আলাদা করা UIDs হ্যান্ডেল করা
-        targets = []
-        if ',' in target_input:
-            targets = [tid.strip() for tid in target_input.split(',') if tid.strip().isdigit()]
-        else:
-            targets = [tid.strip() for tid in target_input.split() if tid.strip().isdigit()]
-            
-        if not targets:
-            # যদি সরাসরি একটি UID হয়
-            if target_input.isdigit():
-                targets = [target_input]
-            else:
-                return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
-
-        success, message = start_multi_spam(targets)
-        return jsonify({'success': success, 'message': message})
-
-    elif action == 'off':
-        if target_input:
-            # নির্দিষ্ট একটি UID অফ করা
-            success, message = stop_spam(target_input)
-            stop_smart_monitor(target_input) # যদি স্মার্ট মনিটরে থাকে সেটাও অফ হবে
-            return jsonify({'success': success, 'message': message})
-        else:
-            # সব স্প্যাম অফ করা
-            stop_all_spam()
-            stop_invite_targets_spam()
-            return jsonify({'success': True, 'message': 'All normal spam stopped successfully!'})
-
-    return jsonify({'success': False, 'message': 'Invalid action! Use action=on or action=off'}), 400
-
-@app.route('/api/start', methods=['POST'])
-def api_start():
-    data = request.get_json()
-    target_input = data.get('uid', '').strip()
-    smart_mode = data.get('smart', False)
+# GET API - Full Spam
+@app.route('/api/spam/all/<uid>', methods=['GET'])
+@login_required
+def api_get_full_spam(uid):
+    """GET API: Start full spam on a target (room + squad + badge + group)"""
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
     
-    if ',' in target_input:
-        targets = [tid.strip() for tid in target_input.split(',') if tid.strip().isdigit()]
-    elif ' ' in target_input:
-        targets = [tid.strip() for tid in target_input.split() if tid.strip().isdigit()]
-    else:
-        targets = [target_input] if target_input.isdigit() else []
-    
-    if not targets:
-        return jsonify({'success': False, 'message': 'Valid UID(s) required'})
-    
-    if smart_mode:
-        success_count = 0
-        for uid in targets:
-            success, msg = start_smart_monitor(uid)
-            if success:
-                success_count += 1
-        return jsonify({'success': success_count > 0, 'message': f'Smart monitoring started on {success_count}/{len(targets)} targets'})
-    else:
-        success, message = start_multi_spam(targets)
-        return jsonify({'success': success, 'message': message})
-
-@app.route('/api/stop', methods=['POST'])
-def api_stop():
-    data = request.get_json()
-    target_id = data.get('uid', '').strip()
-    
-    if not target_id:
-        return jsonify({'success': False, 'message': 'UID is required'})
-    
-    success, message = stop_spam(target_id)
-    stop_smart_monitor(target_id)
+    success, message = start_spam(uid, 'full')
     return jsonify({'success': success, 'message': message})
 
-@app.route('/api/stop-all', methods=['POST'])
-def api_stop_all():
-    stop_auto_spam()
-    return jsonify({'success': True, 'message': 'All spam stopped'})
+# GET API - Squad Spam
+@app.route('/api/spam/squad/<uid>', methods=['GET'])
+@login_required
+def api_get_squad_spam(uid):
+    """GET API: Start squad spam on a target (group invites only)"""
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
+    
+    success, message = start_spam(uid, 'squad')
+    return jsonify({'success': success, 'message': message})
 
+# GET API - Stop Spam
+@app.route('/api/stop/<uid>', methods=['GET'])
+@login_required
+def api_get_stop_spam(uid):
+    """GET API: Stop spam on a target"""
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
+    
+    success, message = stop_spam(uid)
+    return jsonify({'success': success, 'message': message})
+
+# GET API - Stop All
+@app.route('/api/stop-all', methods=['GET'])
+@login_required
+def api_get_stop_all():
+    """GET API: Stop all spam"""
+    success, message = stop_all_spam()
+    return jsonify({'success': success, 'message': message})
+
+# GET API - Status
 @app.route('/api/status', methods=['GET'])
-def api_status():
-    status = get_status()
-    return jsonify({'success': True, 'data': status})
+@login_required
+def api_get_status():
+    """GET API: Get spam status"""
+    return jsonify({'success': True, 'data': get_spam_status()})
 
+# GET API - Reset
+@app.route('/api/reset', methods=['GET'])
+@login_required
+def api_get_reset():
+    """GET API: Manually trigger auto reset"""
+    success, message = trigger_manual_reset()
+    return jsonify({'success': success, 'message': message})
+
+# GET API - Accounts
 @app.route('/api/accounts', methods=['GET'])
-def api_accounts():
+@login_required
+def api_get_accounts():
+    """GET API: Get connected accounts"""
     with connected_clients_lock:
-        return jsonify({
-            'success': True,
-            'count': len(connected_clients),
-            'accounts': list(connected_clients.keys())
-        })
+        accounts = list(connected_clients.keys())
+    return jsonify({'success': True, 'accounts': accounts})
 
-@app.route('/api/auto-uids', methods=['GET'])
-def api_get_auto_uids():
-    return jsonify({'success': True, 'uids': auto_uids})
+# ==================== API ROUTES (POST) ====================
 
-@app.route('/api/auto-uids', methods=['POST'])
-def api_update_auto_uids():
+# POST API - Full Spam
+@app.route('/api/spam/all', methods=['POST'])
+@login_required
+def api_post_full_spam():
+    """POST API: Start full spam on target(s)"""
     data = request.get_json()
-    uids = data.get('uids', [])
-    global auto_uids
-    auto_uids = [uid.strip() for uid in uids if uid.strip().isdigit()]
-    save_auto_uids(auto_uids)
-    return jsonify({'success': True, 'message': f'Saved {len(auto_uids)} UIDs'})
+    uid = data.get('uid', '').strip()
+    
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
+    
+    if ',' in uid:
+        uids = [u.strip() for u in uid.split(',') if u.strip().isdigit()]
+    elif ' ' in uid:
+        uids = [u.strip() for u in uid.split() if u.strip().isdigit()]
+    else:
+        uids = [uid]
+    
+    results = []
+    for target in uids:
+        success, message = start_spam(target, 'full')
+        results.append({'uid': target, 'success': success, 'message': message})
+    
+    return jsonify({'success': True, 'results': results})
 
-@app.route('/api/invite-uids', methods=['GET'])
-def api_get_invite_uids():
-    return jsonify({'success': True, 'uids': invite_uids})
-
-@app.route('/api/invite-uids', methods=['POST'])
-def api_update_invite_uids():
+# POST API - Squad Spam
+@app.route('/api/spam/squad', methods=['POST'])
+@login_required
+def api_post_squad_spam():
+    """POST API: Start squad spam on target(s)"""
     data = request.get_json()
-    uids = data.get('uids', [])
-    global invite_uids
-    invite_uids = [uid.strip() for uid in uids if uid.strip().isdigit()]
-    save_invite_uids(invite_uids)
-    # নতুন UIDs যোগ করলে স্প্যাম শুরু করুন
-    if invite_uids:
-        start_invite_targets_spam()
-    return jsonify({'success': True, 'message': f'Saved {len(invite_uids)} invite UIDs'})
+    uid = data.get('uid', '').strip()
+    
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
+    
+    if ',' in uid:
+        uids = [u.strip() for u in uid.split(',') if u.strip().isdigit()]
+    elif ' ' in uid:
+        uids = [u.strip() for u in uid.split() if u.strip().isdigit()]
+    else:
+        uids = [uid]
+    
+    results = []
+    for target in uids:
+        success, message = start_spam(target, 'squad')
+        results.append({'uid': target, 'success': success, 'message': message})
+    
+    return jsonify({'success': True, 'results': results})
 
-@app.route('/api/start-auto', methods=['POST'])
-def api_start_auto():
-    success, message = start_auto_spam()
+# POST API - Stop Spam
+@app.route('/api/stop', methods=['POST'])
+@login_required
+def api_post_stop_spam():
+    """POST API: Stop spam on a target"""
+    data = request.get_json()
+    uid = data.get('uid', '').strip()
+    
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
+    
+    success, message = stop_spam(uid)
     return jsonify({'success': success, 'message': message})
 
-@app.route('/api/stop-auto', methods=['POST'])
-def api_stop_auto():
-    success, message = stop_auto_spam()
+# POST API - Stop All
+@app.route('/api/stop-all', methods=['POST'])
+@login_required
+def api_post_stop_all():
+    """POST API: Stop all spam"""
+    success, message = stop_all_spam()
     return jsonify({'success': success, 'message': message})
 
-@app.route('/api/check-status', methods=['POST'])
-def api_check_status():
-    data = request.get_json()
-    target_id = data.get('uid', '').strip()
-    
-    if not target_id:
-        return jsonify({'success': False, 'message': 'UID is required'})
-    
-    status = get_detailed_status(target_id)
-    return jsonify({'success': True, 'data': status})
+# POST API - Reset
+@app.route('/api/reset', methods=['POST'])
+@login_required
+def api_post_reset():
+    """POST API: Manually trigger auto reset"""
+    success, message = trigger_manual_reset()
+    return jsonify({'success': success, 'message': message})
 
-@app.route('/api/smart-monitors', methods=['GET'])
-def api_smart_monitors():
-    with smart_monitor_lock:
-        return jsonify({
-            'success': True,
-            'monitored': list(smart_monitor_threads.keys())
-        })
-
-# ==================== HTML TEMPLATE ====================
-HTML_TEMPLATE = '''
+# ==================== LOGIN TEMPLATE ====================
+LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>MAHIR SPAM - ULTIMATE MULTI-TARGET</title>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;800&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MAHIR SYSTEM | Secure Login</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@500;700&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --bg-color: rgba(9, 14, 23, 0.85);
-            --card-bg: rgba(17, 24, 38, 0.95);
-            --text-main: #ffffff;
-            --text-muted: #8b9bb4;
-            --primary-red: #ff3366;
-            --primary-blue: #00d4ff;
-            --primary-purple: #9b59b6;
-            --border-color: #233045;
-            --success: #00cc66;
-            --warning: #ffd700;
-            --smart: #9b59b6;
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Rajdhani', sans-serif; }
+        body {
+            background: #05050a;
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            overflow: hidden;
         }
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Poppins', sans-serif; }
-        body { background-color: #000; color: var(--text-main); display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; overflow-x: hidden; }
-        #matrix-canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -1; }
-        
-        .app-container { width: 100%; max-width: 700px; padding: 30px 20px; display: flex; flex-direction: column; gap: 25px; background: var(--bg-color); backdrop-filter: blur(8px); border-radius: 20px; border: 1px solid rgba(255, 51, 102, 0.2); box-shadow: 0 0 40px rgba(0, 0, 0, 0.8); z-index: 1; }
-        
-        .header { text-align: center; margin-bottom: 15px; }
-        .premium-badge { color: var(--warning); font-size: 0.85rem; font-weight: 600; letter-spacing: 2px; display: flex; justify-content: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
-        .main-title { font-size: 2.5rem; font-weight: 800; background: linear-gradient(90deg, var(--primary-red), var(--primary-purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin: 15px 0; }
-        
-        .card { background-color: var(--card-bg); border-radius: 20px; padding: 25px 20px; border: 1px solid var(--border-color); box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        .card-header { display: flex; align-items: center; gap: 15px; margin-bottom: 20px; }
-        .icon-circle { width: 40px; height: 40px; border-radius: 50%; background: rgba(26,35,51,0.9); display: flex; justify-content: center; align-items: center; color: var(--primary-red); font-size: 1.2rem; }
-        .card-title h3 { font-size: 1.2rem; font-weight: 600; }
-        .card-title p { font-size: 0.75rem; color: var(--text-muted); }
-        
-        .input-group { margin-bottom: 15px; }
-        .input-label { display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 8px; }
-        input[type="text"].plain-input, textarea { width: 100%; background: rgba(9,14,23,0.7); border: 1px solid var(--border-color); color: white; padding: 15px; border-radius: 12px; font-size: 1rem; outline: none; }
-        input[type="text"].plain-input:focus, textarea:focus { border-color: var(--primary-red); box-shadow: 0 0 10px rgba(255,51,102,0.3); }
-        textarea { resize: vertical; font-family: monospace; }
-        
-        .btn { width: 100%; padding: 14px; border: none; border-radius: 12px; font-size: 1rem; font-weight: 600; cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 10px; transition: 0.3s; margin-top: 12px; }
-        .btn-primary { background: linear-gradient(90deg, var(--primary-red), var(--primary-purple)); color: white; }
-        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,51,102,0.3); }
-        .btn-danger-outline { background: transparent; border: 1px solid var(--primary-red); color: var(--primary-red); }
-        .btn-danger-outline:hover { background: rgba(255,51,102,0.1); transform: translateY(-2px); }
-        .btn-warning { background: transparent; border: 1px solid var(--warning); color: var(--warning); }
-        .btn-warning:hover { background: rgba(255,215,0,0.1); transform: translateY(-2px); }
-        .btn-success { background: transparent; border: 1px solid var(--success); color: var(--success); }
-        .btn-success:hover { background: rgba(0,204,102,0.1); transform: translateY(-2px); }
-        .btn-smart { background: linear-gradient(90deg, #8e44ad, #9b59b6); color: white; }
-        .btn-smart:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(155,89,182,0.3); }
-        
-        .console-box { background: #000; border: 1px solid var(--border-color); border-radius: 12px; height: 200px; padding: 15px; font-family: 'Courier New', monospace; font-size: 0.75rem; color: var(--primary-blue); overflow-y: auto; text-align: left; }
-        .console-line { margin-bottom: 6px; }
-        .console-line .time { color: var(--text-muted); margin-right: 10px; }
-        .console-line .success { color: var(--success); }
-        .console-line .error { color: var(--primary-red); }
-        .console-line .info { color: var(--primary-blue); }
-        .console-line .smart { color: #9b59b6; }
-        
-        .badge-info { background: rgba(155,89,182,0.1); color: var(--primary-purple); border: 1px solid var(--primary-purple); padding: 12px; border-radius: 12px; text-align: center; font-size: 0.8rem; font-weight: 600; margin-top: 15px; }
-        .status-badge { background: rgba(0,204,102,0.1); color: var(--success); border: 1px solid var(--success); padding: 12px; border-radius: 12px; text-align: center; display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 10px; font-size: 0.8rem; font-weight: 600; }
-        .status-dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; animation: pulse 1.5s infinite; }
-        .smart-badge { background: rgba(155,89,182,0.1); color: #9b59b6; border: 1px solid #9b59b6; }
-        
-        @keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.3); opacity: 0.5; } }
-        
-        .active-list, .accounts-list { max-height: 200px; overflow-y: auto; margin-top: 10px; }
-        .active-item { background: rgba(30,30,40,0.8); padding: 12px; margin: 8px 0; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid #ff3366; }
-        .active-uid { font-family: monospace; font-weight: bold; color: #ff3366; font-size: 14px; }
-        .smart-item { border-left-color: #9b59b6; }
-        .stop-small { background: #eb3349; color: white; border: none; padding: 6px 18px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: bold; transition: 0.2s; }
-        .stop-small:hover { background: #c0392b; }
-        .account-item { background: rgba(30,30,40,0.6); padding: 6px 12px; margin: 4px 0; border-radius: 8px; font-family: monospace; font-size: 11px; color: #4facfe; }
-        
-        .flex-buttons { display: flex; gap: 12px; margin-top: 12px; }
-        .flex-buttons .btn { margin-top: 0; }
-        
-        .refresh-badge { background: rgba(255,215,0,0.15); color: var(--warning); border: 1px solid var(--warning); border-radius: 12px; padding: 8px; text-align: center; font-size: 0.7rem; margin-top: 10px; }
-        
-        .copyright { text-align: center; color: var(--text-muted); font-size: 0.7rem; margin-top: 20px; }
-        
-        ::-webkit-scrollbar { width: 5px; }
-        ::-webkit-scrollbar-track { background: #1a1a2e; border-radius: 10px; }
-        ::-webkit-scrollbar-thumb { background: #ff3366; border-radius: 10px; }
-        
-        .mode-toggle { display: flex; gap: 10px; margin-bottom: 15px; }
-        .mode-btn { flex: 1; padding: 10px; background: rgba(30,30,40,0.6); border: 1px solid var(--border-color); border-radius: 10px; cursor: pointer; text-align: center; transition: 0.3s; }
-        .mode-btn.active { background: linear-gradient(90deg, var(--primary-red), var(--primary-purple)); border-color: var(--primary-red); }
-        .mode-btn.smart-mode.active { background: linear-gradient(90deg, #8e44ad, #9b59b6); }
-        
-        .feature-badge {
-            display: inline-block;
-            background: rgba(255,51,102,0.2);
-            color: #ff3366;
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 10px;
-            margin: 2px;
-        }
-        
-        .multi-hint {
-            background: rgba(0,212,255,0.1);
-            border: 1px solid #00d4ff;
-            border-radius: 8px;
-            padding: 8px;
-            font-size: 11px;
-            color: #00d4ff;
-            margin-top: 8px;
+        #matrix-canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 0; }
+        .login-box {
+            background: rgba(10, 10, 25, 0.8);
+            border: 1px solid rgba(255, 0, 127, 0.3);
+            border-radius: 16px;
+            padding: 50px 35px;
+            width: 100%;
+            max-width: 420px;
+            backdrop-filter: blur(15px);
             text-align: center;
+            position: relative;
+            z-index: 1;
+            box-shadow: 0 0 60px rgba(255, 0, 127, 0.1);
         }
+        .login-box h1 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 2.2rem;
+            background: linear-gradient(135deg, #ff007f, #7f00ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 5px;
+        }
+        .login-box p.sub {
+            color: #00ffcc;
+            text-transform: uppercase;
+            letter-spacing: 4px;
+            margin-bottom: 35px;
+            font-size: 0.85rem;
+        }
+        .input-group {
+            position: relative;
+            margin-bottom: 25px;
+        }
+        .input-group i {
+            position: absolute;
+            left: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: rgba(255,255,255,0.3);
+            font-size: 1.1rem;
+        }
+        .input-group input {
+            width: 100%;
+            padding: 15px 15px 15px 45px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 10px;
+            color: #fff;
+            font-size: 1.1rem;
+            outline: none;
+            transition: 0.3s;
+        }
+        .input-group input:focus {
+            border-color: #ff007f;
+            box-shadow: 0 0 20px rgba(255, 0, 127, 0.15);
+        }
+        .btn-login {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #ff007f, #7f00ff);
+            border: none;
+            border-radius: 10px;
+            color: #fff;
+            font-size: 1.2rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: 0.3s;
+            letter-spacing: 2px;
+        }
+        .btn-login:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 30px rgba(255, 0, 127, 0.3);
+        }
+        .error { color: #ff4444; margin-top: 15px; font-weight: 600; }
+        .footer-text { color: rgba(255,255,255,0.2); font-size: 0.7rem; margin-top: 20px; letter-spacing: 1px; }
     </style>
 </head>
 <body>
     <canvas id="matrix-canvas"></canvas>
-
-    <div class="app-container">
-        <div class="header">
-            <div class="premium-badge"><i class="fa-solid fa-crown"></i> ULTIMATE MULTI-TARGET</div>
-            <h1 class="main-title">MAHIR<br>SPAM</h1>
-            <div class="premium-badge">
-                <i class="fa-solid fa-users"></i> 3/5/6 INVITE | 
-                <i class="fa-solid fa-medal"></i> V-BADGE | 
-                <i class="fa-solid fa-brain"></i> SMART |
-                <i class="fa-solid fa-layer-group"></i> MULTI-TARGET
-            </div>
-        </div>
-
-        <!-- Auto UIDs Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-file-alt"></i></div>
-                <div class="card-title"><h3>AUTO UIDs (auto_uid.txt)</h3><p>সব UID তে একসাথে স্প্যাম করবে</p></div>
-            </div>
-            <textarea id="autoUidsText" rows="4" placeholder="এক লাইনে একটি UID দিয়ে সব টার্গেট লিখুন&#10;Example:&#10;1234567890&#10;0987654321&#10;1122334455"></textarea>
-            <div class="flex-buttons">
-                <button class="btn btn-success" onclick="saveAutoUids()"><i class="fa-solid fa-save"></i> SAVE</button>
-                <button class="btn btn-smart" onclick="startAutoSpam()"><i class="fa-solid fa-brain"></i> START SMART</button>
-                <button class="btn btn-danger-outline" onclick="stopAutoSpam()"><i class="fa-solid fa-stop"></i> STOP ALL</button>
-            </div>
-        </div>
-
-        <!-- Invite UIDs Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-user-plus"></i></div>
-                <div class="card-title"><h3>INVITE UIDs (inv_uid.txt)</h3><p>এই UID গুলো ইনভাইট পাবে</p></div>
-            </div>
-            <textarea id="inviteUidsText" rows="3" placeholder="এক লাইনে একটি UID"></textarea>
-            <div class="flex-buttons">
-                <button class="btn btn-purple" onclick="saveInviteUids()"><i class="fa-solid fa-save"></i> SAVE INVITE UIDs</button>
-            </div>
-        </div>
-
-        <!-- Single/Multi Target Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-bullseye"></i></div>
-                <div class="card-title"><h3>TARGET UIDs</h3><p>একাধিক UID কমা(,) বা স্পেস দিয়ে আলাদা করুন</p></div>
-            </div>
-            <div class="mode-toggle">
-                <div id="normalModeBtn" class="mode-btn active" onclick="setMode('normal')"><i class="fa-solid fa-fire"></i> NORMAL</div>
-                <div id="smartModeBtn" class="mode-btn smart-mode" onclick="setMode('smart')"><i class="fa-solid fa-brain"></i> SMART</div>
-            </div>
+    <div class="login-box">
+        <h1>MAHIR SYSTEM</h1>
+        <p class="sub">Access Control Panel</p>
+        <form action="/login" method="POST">
             <div class="input-group">
-                <div class="input-label"><i class="fa-solid fa-crosshairs"></i> TARGET UID(s)</div>
-                <input type="text" id="startUid" class="plain-input" placeholder="এক বা একাধিক UID: 1234567890,0987654321,1122334455">
+                <i class="fas fa-key"></i>
+                <input type="password" name="password" placeholder="Enter Security Password" required>
             </div>
-            <div class="multi-hint">
-                <i class="fa-solid fa-info-circle"></i> একাধিক UID: কমা(,) বা স্পেস দিয়ে আলাদা করুন যেমন: 1234567890,0987654321,1122334455
-            </div>
-            <div class="flex-buttons">
-                <button class="btn btn-primary" onclick="startSpam()"><i class="fa-solid fa-play"></i> START SPAM</button>
-                <button class="btn btn-smart" onclick="checkAndStartSmart()"><i class="fa-solid fa-search"></i> CHECK & START</button>
-            </div>
-        </div>
-
-        <!-- Stop Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-stop"></i></div>
-                <div class="card-title"><h3>STOP SPAM</h3><p>একটি বা সব টার্গেট বন্ধ করুন</p></div>
-            </div>
-            <div class="input-group">
-                <div class="input-label"><i class="fa-solid fa-crosshairs"></i> UID TO STOP</div>
-                <input type="text" id="stopUid" class="plain-input" placeholder="Enter UID to Stop">
-            </div>
-            <div class="flex-buttons">
-                <button class="btn btn-danger-outline" onclick="stopSpam()"><i class="fa-solid fa-power-off"></i> STOP</button>
-                <button class="btn btn-warning" onclick="stopAllSpam()"><i class="fa-solid fa-stop-circle"></i> STOP ALL</button>
-            </div>
-        </div>
-
-        <!-- Status Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-terminal"></i></div>
-                <div class="card-title"><h3>Console & Status</h3><p>Live Logs</p></div>
-            </div>
-            
-            <div class="console-box" id="consoleBox">
-                <div class="console-line"><span class="time">[System]</span> <span class="info">MAHIR SPAM ULTIMATE Ready</span></div>
-                <div class="console-line"><span class="time">[System]</span> <span class="info">Multi-Target Support: একসাথে যত ইচ্ছে UID তে স্প্যাম</span></div>
-                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-refresh every 7 minutes</span></div>
-            </div>
-            
-            <div class="badge-info"><i class="fa-solid fa-medal"></i> V-BADGE + PRO_BADGE + CRAFTLAND + MODERATOR</div>
-            <div class="status-badge">
-                <div class="status-dot"></div>
-                <span>STATUS: <span id="statusText">IDLE</span></span>
-            </div>
-            <div class="badge smart-badge">
-                <i class="fa-solid fa-brain"></i> SMART MONITORING: <span id="smartCount">0</span> targets
-            </div>
-            <div class="refresh-badge">
-                <i class="fa-solid fa-clock"></i> Auto-refresh every 7 minutes
-            </div>
-        </div>
-
-        <!-- Features Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-star"></i></div>
-                <div class="card-title"><h3>SPAM FEATURES</h3><p>What's included</p></div>
-            </div>
-            <div style="display: flex; flex-wrap: wrap; gap: 8px;">
-                <span class="feature-badge"><i class="fa-solid fa-door-open"></i> Room Join</span>
-                <span class="feature-badge"><i class="fa-solid fa-user-group"></i> 3-Player Group</span>
-                <span class="feature-badge"><i class="fa-solid fa-user-group"></i> 5-Player Group</span>
-                <span class="feature-badge"><i class="fa-solid fa-user-group"></i> 6-Player Group</span>
-                <span class="feature-badge"><i class="fa-solid fa-medal"></i> V-Badge Join</span>
-                <span class="feature-badge"><i class="fa-solid fa-trophy"></i> PRO Badge Join</span>
-                <span class="feature-badge"><i class="fa-solid fa-hammer"></i> CRAFTLAND Badge</span>
-                <span class="feature-badge"><i class="fa-solid fa-shield"></i> MODERATOR Badge</span>
-                <span class="feature-badge"><i class="fa-solid fa-brain"></i> Smart Monitor</span>
-                <span class="feature-badge"><i class="fa-solid fa-chart-line"></i> Status Check</span>
-                <span class="feature-badge"><i class="fa-solid fa-layer-group"></i> Multi-Target</span>
-            </div>
-        </div>
-
-        <!-- Active Targets Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-list"></i></div>
-                <div class="card-title"><h3>ACTIVE TARGETS</h3><p>সক্রিয় টার্গেট গুলো</p></div>
-            </div>
-            <div id="activeSpamList" class="active-list">
-                <div class="console-line">📭 No active targets</div>
-            </div>
-        </div>
-
-        <!-- Smart Monitored Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-brain"></i></div>
-                <div class="card-title"><h3>SMART MONITORED</h3><p>স্মার্ট মনিটরে থাকা টার্গেট</p></div>
-            </div>
-            <div id="smartMonitoredList" class="active-list">
-                <div class="console-line">📭 No smart monitored targets</div>
-            </div>
-        </div>
-
-        <!-- Connected Accounts Card -->
-        <div class="card">
-            <div class="card-header">
-                <div class="icon-circle"><i class="fa-solid fa-users"></i></div>
-                <div class="card-title"><h3>CONNECTED ACCOUNTS</h3><p>অনলাইন অ্যাকাউন্ট</p></div>
-            </div>
-            <div id="accountsList" class="accounts-list">
-                <div class="console-line">Loading...</div>
-            </div>
-        </div>
-
-        <div class="copyright">
-            MAHIR SPAM ULTIMATE <i class="fa-solid fa-heart" style="color: #ff3366;"></i> v7.0 | যত ইচ্ছে UID তে একসাথে স্প্যাম
-        </div>
+            <button type="submit" class="btn-login"><i class="fas fa-unlock-alt"></i> UNLOCK</button>
+            {% if error %}<div class="error"><i class="fas fa-exclamation-circle"></i> {{ error }}</div>{% endif %}
+        </form>
+        <div class="footer-text">MAHIR ENGINE v3.0</div>
     </div>
-
     <script>
-        let currentMode = 'normal';
-        
         const canvas = document.getElementById('matrix-canvas');
         const ctx = canvas.getContext('2d');
         canvas.width = window.innerWidth;
@@ -2107,9 +1245,9 @@ HTML_TEMPLATE = '''
         const drops = Array(Math.floor(columns)).fill(1);
 
         function drawMatrix() {
-            ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+            ctx.fillStyle = 'rgba(5, 5, 10, 0.05)';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.fillStyle = '#ff3366';
+            ctx.fillStyle = '#ff007f';
             ctx.font = fontSize + 'px monospace';
             drops.forEach((y, i) => {
                 const text = chars[Math.floor(Math.random() * chars.length)];
@@ -2120,327 +1258,415 @@ HTML_TEMPLATE = '''
         }
         setInterval(drawMatrix, 35);
         window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; });
+    </script>
+</body>
+</html>
+'''
 
-        function logToConsole(message, type = 'info') {
+# ==================== HTML TEMPLATE ====================
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔥 MAHIR SYSTEM - SPAM CONTROL</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #060417, #0e0b30, #130a24);
+            min-height: 100vh;
+            color: #fff;
+            padding: 20px;
+        }
+        #matrix-canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 0; opacity: 0.3; }
+        .container { max-width: 1400px; margin: 0 auto; position: relative; z-index: 1; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 20px; flex-wrap: wrap; gap: 15px;}
+        .logo { font-size: 2.5rem; font-weight: 800; background: linear-gradient(135deg, #ff007f, #7f00ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-shadow: 0 0 30px rgba(255,0,127,0.15); }
+        .logo i { -webkit-text-fill-color: initial; color: #ff007f; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: rgba(255,255,255,0.03); backdrop-filter: blur(15px); border-radius: 16px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.06); box-shadow: 0 8px 32px rgba(0,0,0,0.3); transition: 0.3s; }
+        .stat-card:hover { transform: translateY(-3px); border-color: rgba(255,0,127,0.2); }
+        .stat-card i { font-size: 2rem; margin-bottom: 8px; color: #ff007f; }
+        .stat-card h3 { font-size: 0.75rem; color: rgba(255,255,255,0.4); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 1px; }
+        .stat-card .value { font-size: 2rem; font-weight: 800; }
+        .controls-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .control-card { background: rgba(255,255,255,0.02); backdrop-filter: blur(15px); border-radius: 16px; padding: 25px; border: 1px solid rgba(255,255,255,0.06); box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+        .control-card h3 { font-size: 1rem; margin-bottom: 15px; display: flex; align-items: center; gap: 10px; }
+        .control-card h3 i { color: #ff007f; }
+        .input-group { display: flex; gap: 10px; flex-wrap: wrap; }
+        .input-group input { flex: 1; padding: 12px 16px; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; background: rgba(0,0,0,0.4); color: #fff; font-size: 0.95rem; font-family: monospace; outline: none; transition: 0.3s; min-width: 150px; }
+        .input-group input:focus { border-color: #ff007f; box-shadow: 0 0 15px rgba(255,0,127,0.1); }
+        .btn { padding: 12px 24px; border: none; border-radius: 10px; font-weight: 600; cursor: pointer; transition: all 0.3s; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 8px; }
+        .btn-primary { background: linear-gradient(135deg, #ff007f, #7f00ff); color: #fff; }
+        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,0,127,0.3); }
+        .btn-success { background: linear-gradient(135deg, #00b09b, #96c93d); color: #fff; }
+        .btn-success:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(0,176,155,0.3); }
+        .btn-danger { background: linear-gradient(135deg, #ff0844, #ffb199); color: #fff; }
+        .btn-danger:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,8,68,0.3); }
+        .btn-warning { background: linear-gradient(135deg, #ffaa00, #ff6600); color: #000; }
+        .btn-warning:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,170,0,0.3); }
+        .btn-purple { background: linear-gradient(135deg, #8e44ad, #9b59b6); color: #fff; }
+        .btn-purple:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(155,89,182,0.3); }
+        .btn-outline { background: transparent; border: 1px solid rgba(255,255,255,0.15); color: #fff; }
+        .btn-outline:hover { background: rgba(255,255,255,0.05); }
+        .btn-sm { padding: 8px 14px; font-size: 0.8rem; }
+        .active-list { max-height: 400px; overflow-y: auto; margin-top: 10px; }
+        .active-item { background: rgba(30,30,40,0.6); padding: 12px 16px; margin: 6px 0; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid #ff007f; }
+        .active-uid { font-family: monospace; font-weight: bold; color: #ff007f; font-size: 14px; }
+        .active-type { font-size: 11px; color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.05); padding: 2px 10px; border-radius: 12px; }
+        .stop-small { background: #eb3349; color: white; border: none; padding: 5px 14px; border-radius: 8px; cursor: pointer; font-size: 11px; font-weight: bold; transition: 0.2s; }
+        .stop-small:hover { background: #c0392b; }
+        .account-item { background: rgba(30,30,40,0.4); padding: 4px 12px; margin: 3px 0; border-radius: 6px; font-family: monospace; font-size: 11px; color: #4facfe; display: inline-block; margin-right: 5px; }
+        .console-box { background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; height: 180px; padding: 15px; font-family: 'Courier New', monospace; font-size: 0.75rem; color: #00ffcc; overflow-y: auto; text-align: left; }
+        .console-line { margin-bottom: 4px; }
+        .console-line .time { color: rgba(255,255,255,0.3); margin-right: 10px; }
+        .console-line .success { color: #00ffcc; }
+        .console-line .error { color: #ff3366; }
+        .console-line .info { color: #4facfe; }
+        .badge-info { background: rgba(155,89,182,0.08); color: #9b59b6; border: 1px solid rgba(155,89,182,0.15); padding: 10px; border-radius: 10px; text-align: center; font-size: 0.8rem; margin-top: 10px; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .status-dot.active { background: #00ffcc; animation: pulse 1s infinite; }
+        .status-dot.idle { background: #ff4444; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb { background: #ff007f; border-radius: 10px; }
+        .footer { text-align: center; color: rgba(255,255,255,0.15); font-size: 0.7rem; margin-top: 30px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.03); }
+        .toast { position: fixed; bottom: 20px; right: 20px; background: rgba(0,0,0,0.9); padding: 15px 25px; border-radius: 10px; z-index: 999; animation: slideIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 10px 30px rgba(0,0,0,0.5); color:#fff; display:flex; align-items:center; gap:10px; font-weight:500; backdrop-filter: blur(10px); }
+        .toast.success { border-color: #00b09b; }
+        .toast.error { border-color: #ff0844; }
+        .toast.info { border-color: #4facfe; }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        .spam-type-toggle { display: flex; gap: 10px; margin: 10px 0; }
+        .spam-type-btn { flex: 1; padding: 8px; background: rgba(30,30,40,0.4); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; cursor: pointer; text-align: center; transition: 0.3s; font-size: 0.8rem; }
+        .spam-type-btn.active { background: linear-gradient(135deg, #ff007f, #7f00ff); border-color: #ff007f; }
+        .spam-type-btn:hover { border-color: rgba(255,0,127,0.3); }
+        .api-hint { background: rgba(0,212,255,0.05); border: 1px dashed rgba(0,212,255,0.2); border-radius: 8px; padding: 8px 12px; font-size: 0.7rem; color: rgba(255,255,255,0.4); margin-top: 10px; font-family: monospace; overflow-x: auto; white-space: nowrap; }
+        @media (max-width: 768px) { .controls-grid { grid-template-columns: 1fr; } .input-group { flex-direction: column; } .btn { width: 100%; justify-content: center; } .header { flex-direction: column; text-align: center; } }
+    </style>
+</head>
+<body>
+    <canvas id="matrix-canvas"></canvas>
+    <div class="container">
+        <div class="header">
+            <div>
+                <div class="logo"><i class="fas fa-bolt"></i> MAHIR SYSTEM</div>
+                <div style="color: rgba(255,255,255,0.3); font-size:0.85rem;">SPAM CONTROL ENGINE v3.0</div>
+            </div>
+            <a href="/logout" class="btn btn-outline btn-sm"><i class="fas fa-sign-out-alt"></i> LOGOUT</a>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card"><i class="fas fa-bullseye"></i><h3>ACTIVE TARGETS</h3><div class="value" id="activeCount">0</div></div>
+            <div class="stat-card"><i class="fas fa-robot"></i><h3>BOT ACCOUNTS</h3><div class="value" id="botCount">0</div></div>
+            <div class="stat-card"><i class="fas fa-users"></i><h3>GROUP ACCOUNTS</h3><div class="value" id="groupCount">0</div></div>
+            <div class="stat-card"><i class="fas fa-clock"></i><h3>AUTO RESET</h3><div class="value" style="font-size:1.2rem;">2 HOURS</div></div>
+        </div>
+
+        <div class="controls-grid">
+            <!-- Full Spam Control -->
+            <div class="control-card">
+                <h3><i class="fas fa-fire"></i> FULL SPAM</h3>
+                <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Room + Squad + Badge + Group Invites</div>
+                <div class="input-group">
+                    <input type="text" id="fullUid" placeholder="Target UID(s) (comma separated)">
+                    <button class="btn btn-primary" onclick="startFullSpam()"><i class="fas fa-play"></i> START</button>
+                </div>
+                <div class="api-hint">GET: /api/spam/all/&lt;UID&gt; | POST: /api/spam/all</div>
+            </div>
+
+            <!-- Squad Spam Control -->
+            <div class="control-card">
+                <h3><i class="fas fa-users"></i> SQUAD SPAM</h3>
+                <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Group Invites Only (3, 5, 6 Player)</div>
+                <div class="input-group">
+                    <input type="text" id="squadUid" placeholder="Target UID(s) (comma separated)">
+                    <button class="btn btn-success" onclick="startSquadSpam()"><i class="fas fa-play"></i> START</button>
+                </div>
+                <div class="api-hint">GET: /api/spam/squad/&lt;UID&gt; | POST: /api/spam/squad</div>
+            </div>
+        </div>
+
+        <div class="controls-grid">
+            <!-- Stop Controls -->
+            <div class="control-card">
+                <h3><i class="fas fa-stop"></i> STOP SPAM</h3>
+                <div class="input-group">
+                    <input type="text" id="stopUid" placeholder="Target UID to stop">
+                    <button class="btn btn-danger" onclick="stopSingleSpam()"><i class="fas fa-power-off"></i> STOP</button>
+                </div>
+                <div style="display:flex; gap:10px; margin-top:12px; flex-wrap:wrap;">
+                    <button class="btn btn-warning" onclick="stopAllSpam()" style="flex:1;"><i class="fas fa-stop-circle"></i> STOP ALL</button>
+                    <button class="btn btn-purple" onclick="triggerReset()" style="flex:1;"><i class="fas fa-sync"></i> RESET NOW</button>
+                </div>
+                <div class="api-hint">GET: /api/stop/&lt;UID&gt; | GET: /api/stop-all | GET: /api/reset</div>
+            </div>
+
+            <!-- File Info -->
+            <div class="control-card">
+                <h3><i class="fas fa-file"></i> ACCOUNT FILES</h3>
+                <div style="background:rgba(0,0,0,0.3); padding:12px; border-radius:8px; font-size:0.85rem;">
+                    <div><span style="color:#00ffcc;">📁 accs.txt</span> <span id="accCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Room Spam</span></div>
+                    <div><span style="color:#ffaa00;">📁 group.txt</span> <span id="groupFileCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Squad Spam</span></div>
+                    <div style="font-size:0.7rem; color:rgba(255,255,255,0.2); margin-top:8px;">Place accounts in these files to enable spam</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Active Targets -->
+        <div class="control-card" style="margin-bottom:30px;">
+            <h3><i class="fas fa-list"></i> ACTIVE TARGETS</h3>
+            <div id="activeList" class="active-list">
+                <div style="color:rgba(255,255,255,0.3); text-align:center; padding:20px;">No active targets</div>
+            </div>
+        </div>
+
+        <!-- Console -->
+        <div class="control-card" style="margin-bottom:30px;">
+            <h3><i class="fas fa-terminal"></i> CONSOLE</h3>
+            <div class="console-box" id="consoleBox">
+                <div class="console-line"><span class="time">[System]</span> <span class="info">MAHIR SPAM ENGINE Initialized</span></div>
+                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset every 2 hours</span></div>
+            </div>
+        </div>
+
+        <!-- Connected Accounts -->
+        <div class="control-card">
+            <h3><i class="fas fa-robot"></i> CONNECTED ACCOUNTS</h3>
+            <div id="accountsContainer">
+                <span style="color:rgba(255,255,255,0.3); font-size:0.85rem;">Loading...</span>
+            </div>
+        </div>
+
+        <div class="footer">
+            MAHIR SYSTEM v3.0 | <i class="fas fa-code"></i> Engine by MAHIR | Auto Reset: 2 Hours
+        </div>
+    </div>
+
+    <script>
+        // Matrix Background
+        const canvas = document.getElementById('matrix-canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&'.split('');
+        const fontSize = 12;
+        const columns = canvas.width / fontSize;
+        const drops = Array(Math.floor(columns)).fill(1);
+
+        function drawMatrix() {
+            ctx.fillStyle = 'rgba(5, 5, 10, 0.05)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#ff007f';
+            ctx.font = fontSize + 'px monospace';
+            drops.forEach((y, i) => {
+                const text = chars[Math.floor(Math.random() * chars.length)];
+                ctx.globalAlpha = 0.3 + Math.random() * 0.3;
+                ctx.fillText(text, i * fontSize, y * fontSize);
+                ctx.globalAlpha = 1;
+                if (y * fontSize > canvas.height && Math.random() > 0.975) drops[i] = 0;
+                drops[i]++;
+            });
+        }
+        setInterval(drawMatrix, 50);
+
+        // Toast notifications
+        function showToast(msg, type = 'info') {
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            const icons = { success: 'fa-check-circle', error: 'fa-exclamation-circle', info: 'fa-info-circle' };
+            toast.innerHTML = `<i class="fas ${icons[type] || icons.info}"></i> ${msg}`;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
+        }
+
+        // Console log
+        function logToConsole(msg, type = 'info') {
             const consoleBox = document.getElementById('consoleBox');
             const now = new Date();
             const timeStr = now.toLocaleTimeString();
             const line = document.createElement('div');
             line.className = 'console-line';
-            line.innerHTML = `<span class="time">[${timeStr}]</span> <span class="${type}">${message}</span>`;
+            line.innerHTML = `<span class="time">[${timeStr}]</span> <span class="${type}">${msg}</span>`;
             consoleBox.appendChild(line);
             consoleBox.scrollTop = consoleBox.scrollHeight;
             if (consoleBox.children.length > 100) consoleBox.removeChild(consoleBox.children[0]);
         }
 
-        function setMode(mode) {
-            currentMode = mode;
-            document.getElementById('normalModeBtn').classList.remove('active');
-            document.getElementById('smartModeBtn').classList.remove('active');
-            if (mode === 'normal') {
-                document.getElementById('normalModeBtn').classList.add('active');
-                logToConsole('🔄 NORMAL মোড সক্রিয় (সব টার্গেটে একসাথে স্প্যাম)', 'info');
-            } else {
-                document.getElementById('smartModeBtn').classList.add('active');
-                logToConsole('🧠 SMART মোড সক্রিয় (স্ট্যাটাস দেখে অটো স্প্যাম)', 'smart');
-            }
-        }
-
-        async function loadAutoUids() {
-            try {
-                const response = await fetch('/api/auto-uids');
-                const data = await response.json();
-                if (data.success && data.uids) {
-                    document.getElementById('autoUidsText').value = data.uids.join('\\n');
-                }
-            } catch (error) { console.error('Error:', error); }
-        }
-
-        async function loadInviteUids() {
-            try {
-                const response = await fetch('/api/invite-uids');
-                const data = await response.json();
-                if (data.success && data.uids) {
-                    document.getElementById('inviteUidsText').value = data.uids.join('\\n');
-                }
-            } catch (error) { console.error('Error:', error); }
-        }
-
-        async function saveAutoUids() {
-            const text = document.getElementById('autoUidsText').value;
-            const uids = text.split('\\n').filter(line => line.trim() && /^\\d+$/.test(line.trim())).map(l => l.trim());
+        // Start Full Spam
+        function startFullSpam() {
+            const uid = document.getElementById('fullUid').value.trim();
+            if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
             
-            try {
-                const response = await fetch('/api/auto-uids', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ uids: uids })
-                });
-                const data = await response.json();
-                if (data.success) {
-                    logToConsole(`✅ ${uids.length} টি UID auto_uid.txt এ সেভ হয়েছে`, 'success');
-                }
-            } catch (error) { logToConsole(`❌ Error: ${error.message}`, 'error'); }
-        }
+            const uids = uid.split(',').map(u => u.trim()).filter(u => /^\\d+$/.test(u));
+            if (uids.length === 0) { showToast('Invalid UID(s)!', 'error'); return; }
 
-        async function saveInviteUids() {
-            const text = document.getElementById('inviteUidsText').value;
-            const uids = text.split('\\n').filter(line => line.trim() && /^\\d+$/.test(line.trim())).map(l => l.trim());
+            logToConsole(`🚀 Starting FULL spam on ${uids.length} target(s): ${uids.join(', ')}`, 'info');
             
-            try {
-                const response = await fetch('/api/invite-uids', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ uids: uids })
-                });
-                const data = await response.json();
+            fetch('/api/spam/all', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uid: uid })
+            })
+            .then(res => res.json())
+            .then(data => {
                 if (data.success) {
-                    logToConsole(`✅ ${uids.length} টি UID inv_uid.txt এ সেভ হয়েছে`, 'success');
-                }
-            } catch (error) { logToConsole(`❌ Error: ${error.message}`, 'error'); }
-        }
-
-        async function startAutoSpam() {
-            try {
-                const response = await fetch('/api/start-auto', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    logToConsole(`🧠 ${data.message}`, 'smart');
+                    showToast(`Started full spam on ${uids.length} target(s)`, 'success');
                     refreshStatus();
                 } else {
-                    logToConsole(`❌ ${data.message}`, 'error');
+                    showToast(data.message || 'Failed to start spam', 'error');
                 }
-            } catch (error) { logToConsole(`❌ Error: ${error.message}`, 'error'); }
+            })
+            .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        async function stopAutoSpam() {
-            try {
-                const response = await fetch('/api/stop-auto', { method: 'POST' });
-                const data = await response.json();
+        // Start Squad Spam
+        function startSquadSpam() {
+            const uid = document.getElementById('squadUid').value.trim();
+            if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
+            
+            const uids = uid.split(',').map(u => u.trim()).filter(u => /^\\d+$/.test(u));
+            if (uids.length === 0) { showToast('Invalid UID(s)!', 'error'); return; }
+
+            logToConsole(`🚀 Starting SQUAD spam on ${uids.length} target(s): ${uids.join(', ')}`, 'info');
+            
+            fetch('/api/spam/squad', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uid: uid })
+            })
+            .then(res => res.json())
+            .then(data => {
                 if (data.success) {
-                    logToConsole(`✅ ${data.message}`, 'success');
-                    refreshStatus();
-                }
-            } catch (error) { logToConsole(`❌ Error: ${error.message}`, 'error'); }
-        }
-
-        async function checkAndStartSmart() {
-            const uidInput = document.getElementById('startUid').value.trim();
-            if (!uidInput) { logToConsole('❌ টার্গেট UID দিন!', 'error'); return; }
-            
-            let uids = [];
-            if (uidInput.includes(',')) {
-                uids = uidInput.split(',').map(u => u.trim()).filter(u => /^\\d+$/.test(u));
-            } else if (uidInput.includes(' ')) {
-                uids = uidInput.split(' ').map(u => u.trim()).filter(u => /^\\d+$/.test(u));
-            } else {
-                uids = [uidInput];
-            }
-            
-            if (uids.length === 0) {
-                logToConsole('❌ সঠিক UID দিন!', 'error');
-                return;
-            }
-            
-            for (const uid of uids) {
-                logToConsole(`🔍 ${uid} এর স্ট্যাটাস চেক করা হচ্ছে...`, 'info');
-                
-                try {
-                    const response = await fetch('/api/check-status', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ uid: uid })
-                    });
-                    const data = await response.json();
-                    if (data.success) {
-                        const status = data.data;
-                        logToConsole(`📊 ${uid}: ${status.status} | Online: ${status.is_online}`, 'smart');
-                        
-                        if (status.is_online && status.status !== 'INGAME' && status.status !== 'MATCHMAKING') {
-                            await startSmartSpam(uid);
-                        } else {
-                            logToConsole(`⏸️ ${uid} এর স্ট্যাটাস ${status.status}, স্মার্ট মনিটর শুরু হচ্ছে...`, 'warning');
-                            await startSmartSpam(uid);
-                        }
-                    }
-                } catch (error) { logToConsole(`❌ Error: ${error.message}`, 'error'); }
-            }
-        }
-
-        async function startSmartSpam(uid) {
-            try {
-                const response = await fetch('/api/start', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ uid: uid, smart: true })
-                });
-                const data = await response.json();
-                if (data.success) {
-                    logToConsole(`🧠 ${data.message}`, 'smart');
+                    showToast(`Started squad spam on ${uids.length} target(s)`, 'success');
                     refreshStatus();
                 } else {
-                    logToConsole(`❌ ${data.message}`, 'error');
+                    showToast(data.message || 'Failed to start spam', 'error');
                 }
-            } catch (error) { logToConsole(`❌ Error: ${error.message}`, 'error'); }
+            })
+            .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        async function startSpam() {
-            const uidInput = document.getElementById('startUid').value.trim();
-            if (!uidInput) { logToConsole('❌ টার্গেট UID দিন!', 'error'); return; }
-            
-            // একাধিক UID পার্সিং
-            let uids = [];
-            if (uidInput.includes(',')) {
-                uids = uidInput.split(',').map(u => u.trim()).filter(u => /^\\d+$/.test(u));
-            } else if (uidInput.includes(' ')) {
-                uids = uidInput.split(' ').map(u => u.trim()).filter(u => /^\\d+$/.test(u));
-            } else {
-                uids = [uidInput];
-            }
-            
-            if (uids.length === 0) {
-                logToConsole('❌ সঠিক UID দিন!', 'error');
-                return;
-            }
-
-            if (currentMode === 'smart') {
-                for (const uid of uids) {
-                    await startSmartSpam(uid);
-                }
-            } else {
-                logToConsole(`🚀 ${uids.length} টি টার্গেটে স্প্যাম শুরু হচ্ছে: ${uids.join(', ')}`, 'info');
-                try {
-                    const response = await fetch('/api/start', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ uid: uidInput, smart: false })
-                    });
-                    const data = await response.json();
-                    if (data.success) {
-                        logToConsole(`✅ ${data.message}`, 'success');
-                        document.getElementById('startUid').value = '';
-                        refreshStatus();
-                    } else {
-                        logToConsole(`❌ ${data.message}`, 'error');
-                    }
-                } catch (error) { logToConsole(`❌ Connection error: ${error.message}`, 'error'); }
-            }
-        }
-
-        async function stopSpam() {
+        // Stop Single Spam
+        function stopSingleSpam() {
             const uid = document.getElementById('stopUid').value.trim();
-            if (!uid) { logToConsole('❌ বন্ধ করার জন্য UID দিন!', 'error'); return; }
+            if (!uid) { showToast('Enter target UID to stop!', 'error'); return; }
+            if (!/^\\d+$/.test(uid)) { showToast('Invalid UID!', 'error'); return; }
 
-            logToConsole(`🛑 ${uid} এর স্প্যাম বন্ধ করা হচ্ছে...`, 'info');
-
-            try {
-                const response = await fetch('/api/stop', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ uid: uid, smart: true })
-                });
-                const data = await response.json();
+            logToConsole(`🛑 Stopping spam on ${uid}`, 'info');
+            
+            fetch(`/api/stop/${uid}`)
+            .then(res => res.json())
+            .then(data => {
                 if (data.success) {
-                    logToConsole(`✅ ${data.message}`, 'success');
+                    showToast(data.message, 'success');
                     document.getElementById('stopUid').value = '';
                     refreshStatus();
                 } else {
-                    logToConsole(`❌ ${data.message}`, 'error');
+                    showToast(data.message, 'error');
                 }
-            } catch (error) { logToConsole(`❌ Connection error: ${error.message}`, 'error'); }
+            })
+            .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        async function stopAllSpam() {
-            if (!confirm('⚠️ সব স্প্যাম এবং মনিটর বন্ধ করবেন?')) return;
-
-            logToConsole(`🛑 সব স্প্যাম বন্ধ করা হচ্ছে...`, 'info');
-
-            try {
-                const response = await fetch('/api/stop-all', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({})
-                });
-                const data = await response.json();
+        // Stop All Spam
+        function stopAllSpam() {
+            if (!confirm('⚠️ Stop all spam?')) return;
+            
+            logToConsole('🛑 Stopping ALL spam', 'info');
+            
+            fetch('/api/stop-all')
+            .then(res => res.json())
+            .then(data => {
                 if (data.success) {
-                    logToConsole(`✅ ${data.message}`, 'success');
+                    showToast(data.message, 'success');
                     refreshStatus();
-                } else {
-                    logToConsole(`❌ ${data.message}`, 'error');
                 }
-            } catch (error) { logToConsole(`❌ Connection error: ${error.message}`, 'error'); }
+            })
+            .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        async function refreshStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                if (data.success && data.data) {
+        // Trigger Reset
+        function triggerReset() {
+            if (!confirm('🔄 Manually trigger auto reset? This will stop all spam and reload accounts.')) return;
+            
+            logToConsole('🔄 Triggering manual reset...', 'info');
+            
+            fetch('/api/reset')
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    showToast(data.message, 'success');
+                    refreshStatus();
+                }
+            })
+            .catch(err => { showToast('Error: ' + err.message, 'error'); });
+        }
+
+        // Refresh Status
+        function refreshStatus() {
+            fetch('/api/status')
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
                     const status = data.data;
+                    document.getElementById('activeCount').textContent = status.active_count || 0;
+                    document.getElementById('botCount').textContent = status.accounts_count || 0;
                     
-                    const activeList = document.getElementById('activeSpamList');
+                    const activeList = document.getElementById('activeList');
                     if (status.active_targets && status.active_targets.length > 0) {
-                        document.getElementById('statusText').innerHTML = `<i class="fa-solid fa-bolt"></i> স্প্যামিং: ${status.active_targets.length} টি টার্গেট`;
                         activeList.innerHTML = status.active_targets.map(target => `
                             <div class="active-item">
-                                <div><span class="active-uid">🎯 ${target.uid}</span>
-                                <div style="font-size:10px; color:#888;">♾️ UNLIMITED | ${target.elapsed_minutes} মিনিট</div></div>
-                                <button class="stop-small" onclick="stopFromList('${target.uid}')">STOP</button>
+                                <div>
+                                    <span class="active-uid">🎯 ${target.uid}</span>
+                                    <span class="active-type">${target.type.toUpperCase()}</span>
+                                    <div style="font-size:10px; color:rgba(255,255,255,0.3);">${target.elapsed_minutes}m running</div>
+                                </div>
+                                <button class="stop-small" onclick="quickStop('${target.uid}')">STOP</button>
                             </div>
                         `).join('');
                     } else {
-                        document.getElementById('statusText').innerHTML = `<i class="fa-solid fa-check"></i> নিস্ক্রিয়`;
-                        activeList.innerHTML = '<div class="console-line">📭 কোনো সক্রিয় টার্গেট নেই</div>';
-                    }
-                    
-                    const smartList = document.getElementById('smartMonitoredList');
-                    if (status.smart_monitored && status.smart_monitored.length > 0) {
-                        document.getElementById('smartCount').innerHTML = status.smart_monitored.length;
-                        smartList.innerHTML = status.smart_monitored.map(item => `
-                            <div class="active-item smart-item">
-                                <div><span class="active-uid">🧠 ${item.uid}</span>
-                                <div style="font-size:10px; color:#9b59b6; font-weight: bold;">স্ট্যাটাস: ${item.status || 'চেক করা হচ্ছে...'}</div></div>
-                                <button class="stop-small" onclick="stopFromList('${item.uid}')">STOP</button>
-                            </div>
-                        `).join('');
-                    } else {
-                        document.getElementById('smartCount').innerHTML = '0';
-                        smartList.innerHTML = '<div class="console-line">📭 কোনো স্মার্ট মনিটর টার্গেট নেই</div>';
-                    }
-                    
-                    const accountsList = document.getElementById('accountsList');
-                    if (status.accounts_list && status.accounts_list.length > 0) {
-                        accountsList.innerHTML = status.accounts_list.map(acc => `<div class="account-item"><i class="fa-solid fa-user-check"></i> ${acc}</div>`).join('');
-                        if (status.accounts_count > 50) {
-                            accountsList.innerHTML += `<div class="account-item">... এবং আরও ${status.accounts_count - 50}টি</div>`;
-                        }
-                    } else {
-                        accountsList.innerHTML = '<div class="console-line">⚠️ কোনো অ্যাকাউন্ট সংযুক্ত নেই</div>';
-                    }
-                    
-                    if (status.auto_active) {
-                        logToConsole(`🧠 অটো স্প্যাম সক্রিয়: ${status.auto_uids.length} টি টার্গেট`, 'smart');
+                        activeList.innerHTML = '<div style="color:rgba(255,255,255,0.3); text-align:center; padding:20px;">No active targets</div>';
                     }
                 }
-            } catch (error) { console.error('Status error:', error); }
+            })
+            .catch(err => console.error('Status refresh error:', err));
+
+            // Refresh accounts
+            fetch('/api/accounts')
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    const container = document.getElementById('accountsContainer');
+                    if (data.accounts && data.accounts.length > 0) {
+                        container.innerHTML = data.accounts.map(acc => 
+                            `<span class="account-item">${acc}</span>`
+                        ).join('');
+                    } else {
+                        container.innerHTML = '<span style="color:rgba(255,255,255,0.3); font-size:0.85rem;">No accounts connected</span>';
+                    }
+                }
+            })
+            .catch(err => console.error('Accounts refresh error:', err));
         }
 
-        async function stopFromList(uid) {
+        function quickStop(uid) {
             document.getElementById('stopUid').value = uid;
-            await stopSpam();
+            stopSingleSpam();
         }
 
-        loadAutoUids();
-        loadInviteUids();
-        setInterval(refreshStatus, 3000);
+        // Auto refresh every 5 seconds
+        setInterval(refreshStatus, 5000);
         refreshStatus();
 
-        document.getElementById('startUid').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') startSpam();
-        });
-        document.getElementById('stopUid').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') stopSpam();
-        });
+        // Enter key support
+        document.getElementById('fullUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startFullSpam(); });
+        document.getElementById('squadUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startSquadSpam(); });
+        document.getElementById('stopUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') stopSingleSpam(); });
     </script>
 </body>
 </html>
@@ -2451,34 +1677,29 @@ def main():
     print(f"""
     {C}{BOLD}
     ╔══════════════════════════════════════════════════════════════════════╗
-    ║              🎯 MAHIR SPAM ULTIMATE MULTI-TARGET 🎯                  ║
+    ║              🎯 MAHIR SPAM SYSTEM v3.0 🎯                           ║
     ║                                                                      ║
-    ║     📁 auto_uid.txt  → SMART MONITORED (স্ট্যাটাস দেখে স্প্যাম)      ║
-    ║     📁 inv_uid.txt   → ACTIVE TARGETS (সরাসরি স্প্যাম)               ║
+    ║     📁 accs.txt     → Room + Squad + Badge + Group Spam              ║
+    ║     📁 group.txt    → Squad Creation + Group Invite                  ║
     ║                                                                      ║
-    ║     ✅ 3/5/6 প্লেয়ার গ্রুপ ইনভাইট                                  ║
-    ║     ✅ V-BADGE + PRO_BADGE + CRAFTLAND + MODERATOR জয়িন             ║
-    ║     ✅ স্মার্ট মনিটরিং - স্ট্যাটাস দেখে অটো স্প্যাম                  ║
-    ║     ✅ প্রতি ৭ মিনিটে অটো রিফ্রেশ                                    ║
+    ║     ✅ Full Spam: Room + Squad + Badge + Group Invite               ║
+    ║     ✅ Squad Spam: Group Invites Only (3, 5, 6 Player)              ║
+    ║     ✅ Auto Reset: Every 2 Hours                                    ║
+    ║     ✅ GET/POST API Support                                         ║
     ║                                                                      ║
-    ║     🌐 ওয়েব প্যানেল: http://127.0.0.1:5000                         ║
-    ║     👑 ডেভেলপার: MAHIR                                             ║
+    ║     🌐 Web Panel: http://127.0.0.1:8080                            ║
+    ║     🔑 Password: torikul                                            ║
+    ║     👑 Developer: MAHIR                                             ║
     ╚══════════════════════════════════════════════════════════════════════╝
     {RS}
     """)
     
-    # Load files
-    load_auto_uids()
-    load_invite_uids()
-    
     # Start accounts
     Thread(target=run_accounts, daemon=True).start()
+    Thread(target=run_group_accounts, daemon=True).start()
     
-    # Start auto refresh timer
-    start_auto_refresh()
-    
-    # Start auto spam
-    start_auto_spam()
+    # Start auto reset
+    start_auto_reset()
     
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
