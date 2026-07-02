@@ -2,10 +2,11 @@ import os, sys, time, json, ssl, socket, threading, asyncio, base64, binascii, r
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
 
 import requests
 import urllib3
+from functools import wraps
 from Pb2 import MajoRLoGinrEq_pb2
 import random
 from Crypto.Cipher import AES
@@ -45,15 +46,18 @@ active_power_targets = {}
 active_power_lock = threading.Lock()
 spam_threads = {}
 spam_threads_lock = threading.Lock()
-auto_uids = []      # auto_uid.txt - SMART MONITORED (স্ট্যাটাস দেখে অটো স্প্যাম)
-invite_uids = []    # inv_uid.txt - ACTIVE TARGETS (সরাসরি স্প্যাম)
+auto_uids = []      # auto_uid.txt - SMART MONITORED
+invite_uids = []    # inv_uid.txt - ACTIVE TARGETS
 auto_spam_active = False
 auto_spam_thread = None
 refresh_timer = None
 target_status_cache = {}
 target_group_leaders = {}
-active_invite_targets = {}  # inv_uid.txt এর জন্য সক্রিয় টার্গেট
+active_invite_targets = {}
 invite_spam_thread = None
+smart_monitor_threads = {}
+smart_monitor_lock = threading.Lock()
+smart_target_statuses = {}
 
 C = "\033[96m"
 G = "\033[92m"
@@ -61,7 +65,6 @@ Y = "\033[93m"
 R = "\033[91m"
 RS = "\033[0m"
 BOLD = "\033[1m"
-
 
 # ==================== ব্যাজ ভ্যালু ====================
 BADGES = {
@@ -81,7 +84,7 @@ GROUP_CONFIGS = {
 
 # ==================== FILE LOADERS ====================
 def load_invite_uids(filename="inv_uid.txt"):
-    """Load UIDs from inv_uid.txt - এগুলো সরাসরি ACTIVE TARGETS হিসেবে স্প্যাম পাবে"""
+    """Load UIDs from inv_uid.txt"""
     global invite_uids
     uids = []
     try:
@@ -98,7 +101,6 @@ def load_invite_uids(filename="inv_uid.txt"):
             f.write("# ACTIVE TARGETS - These UIDs will be spammed directly\n")
             f.write("# Example:\n")
             f.write("# 1234567890\n")
-            f.write("# 0987654321\n")
         invite_uids = []
     return invite_uids
 
@@ -112,15 +114,142 @@ def save_invite_uids(uids):
                 file.write(f"{uid}\n")
         global invite_uids
         invite_uids = uids
-        # নতুন UIDs যোগ করলে স্প্যাম শুরু করুন
-        if uids and not auto_spam_active:
-            start_invite_targets_spam()
     except Exception as e:
         print(f"{R}❌ Failed to save inv_uid.txt: {e}{RS}")
 
+def load_auto_uids(filename="auto_uid.txt"):
+    """Load UIDs from auto_uid.txt - SMART MONITORED"""
+    global auto_uids
+    uids = []
+    try:
+        with open(filename, "r", encoding="utf-8") as file:
+            for line in file:
+                uid = line.strip()
+                if uid and not uid.startswith("#") and uid.isdigit():
+                    uids.append(uid)
+        auto_uids = uids
+        print(f"{G}📦 Loaded {len(auto_uids)} SMART MONITOR targets from auto_uid.txt{RS}")
+    except FileNotFoundError:
+        print(f"{Y}⚠️ auto_uid.txt not found! Creating...{RS}")
+        with open(filename, "w") as f:
+            f.write("# SMART MONITORED - These UIDs will be monitored for status\n")
+            f.write("# Example:\n")
+            f.write("# 1234567890\n")
+        auto_uids = []
+    return auto_uids
+
+# ==================== SMART MONITOR FUNCTIONS ====================
+def create_status_check_packet(key, iv, target_uid):
+    """Create status check packet"""
+    try:
+        fields = {
+            1: 33,
+            2: {
+                1: int(target_uid),
+                2: "BD",
+                3: 1,
+                4: 1,
+                5: bytes([1, 7, 9, 10, 11, 18, 25, 26, 32]),
+                6: "[C][B][FF0000] STATUS CHECK",
+                7: 330,
+                8: 1000,
+                10: "BD",
+                11: bytes.fromhex("61" * 32),
+                12: 1,
+                13: int(target_uid),
+                16: 1,
+                17: 1,
+                18: 312,
+                19: 46,
+                23: bytes([16, 1, 24, 1]),
+                24: random.choice([902000028, 902000011, 902000015]),
+                26: "",
+                28: ""
+            },
+            10: "en",
+            13: {2: 1, 3: 1}
+        }
+        
+        packet = create_proto_sync(fields).hex()
+        packet_type = "0519"
+        encrypted = EnC_PacKeT(packet, key, iv)
+        length = len(encrypted) // 2
+        len_hex = DecodE_HeX(length)
+        padding = "000" if len(len_hex) == 5 else "0000"
+        
+        return bytes.fromhex(packet_type + padding + len_hex + encrypted)
+    except Exception as e:
+        return None
+
+def smart_monitor_worker(target_uid):
+    """Smart monitor worker for a single UID"""
+    global smart_target_statuses
+    
+    print(f"{G}🧠 Starting SMART monitor for {target_uid}{RS}")
+    
+    while True:
+        with smart_monitor_lock:
+            if target_uid not in smart_monitor_threads:
+                break
+        
+        with connected_clients_lock:
+            clients_list = list(connected_clients.values())
+        
+        if not clients_list:
+            time.sleep(5)
+            continue
+        
+        # Check status by sending packets
+        status = "CHECKING"
+        try:
+            for client in clients_list[:3]:  # Use first 3 bots
+                if hasattr(client, 'CliEnts2') and client.key:
+                    try:
+                        pkt = create_status_check_packet(client.key, client.iv, target_uid)
+                        if pkt:
+                            client.CliEnts2.send(pkt)
+                            status = "ONLINE"
+                            break
+                    except:
+                        pass
+                time.sleep(0.5)
+        except:
+            status = "ERROR"
+        
+        with smart_monitor_lock:
+            smart_target_statuses[target_uid] = status
+        
+        # If target is online, start spam
+        if status == "ONLINE":
+            print(f"{G}🎯 Target {target_uid} is ONLINE - Starting spam{RS}")
+            start_multi_spam([target_uid])
+        
+        time.sleep(30)  # Check every 30 seconds
+
+def start_smart_monitor(uid):
+    """Start smart monitor for a UID"""
+    with smart_monitor_lock:
+        if uid in smart_monitor_threads:
+            return False, "Already monitoring"
+        
+        thread = Thread(target=smart_monitor_worker, args=(uid,), daemon=True)
+        smart_monitor_threads[uid] = thread
+        thread.start()
+        return True, f"Started monitoring {uid}"
+
+def stop_smart_monitor(uid):
+    """Stop smart monitor for a UID"""
+    with smart_monitor_lock:
+        if uid in smart_monitor_threads:
+            del smart_monitor_threads[uid]
+            if uid in smart_target_statuses:
+                del smart_target_statuses[uid]
+            return True, f"Stopped monitoring {uid}"
+        return False, "Not monitoring"
+
 # ==================== INVITE TARGETS SPAM WORKER ====================
 def invite_targets_spam_worker():
-    """inv_uid.txt এর UID গুলোতে সরাসরি স্প্যাম পাঠানোর জন্য ওয়ার্কার"""
+    """inv_uid.txt এর UID গুলোতে সরাসরি স্প্যাম"""
     global auto_spam_active
     
     print(f"\n{G}{'='*60}{RS}")
@@ -153,10 +282,13 @@ def invite_targets_spam_worker():
         round_number += 1
 
         for target_id in invite_uids:
+            if not auto_spam_active:
+                break
+                
             for client in clients_list:
                 try:
                     if hasattr(client, 'CliEnts2') and client.key:
-                        # === 1. রুম স্প্যাম ===
+                        # Room spam
                         try:
                             open_pkt = openroom(client.key, client.iv)
                             if open_pkt:
@@ -169,17 +301,17 @@ def invite_targets_spam_worker():
                         except:
                             pass
 
-                        # === 2. গ্রুপ ইনভাইট (3/5/6 প্লেয়ার) ===
+                        # Group invites
                         for players in [3, 5, 6]:
                             try:
                                 async def send_invite():
-                                    p1 = await OpEnSq(client.key, client.iv)
+                                    p1 = await OpEnSq(client.key, client.iv, "BD")
                                     client.CliEnts2.send(p1)
                                     await asyncio.sleep(0.05)
-                                    p2 = await cHSq(players, target_id, client.key, client.iv)
+                                    p2 = await cHSq(players, target_id, client.key, client.iv, "BD")
                                     client.CliEnts2.send(p2)
                                     await asyncio.sleep(0.05)
-                                    p3 = await SEnd_InV(players, target_id, client.key, client.iv)
+                                    p3 = await SEnd_InV(players, target_id, client.key, client.iv, "BD")
                                     client.CliEnts2.send(p3)
                                     total_requests += 1
                                     await asyncio.sleep(0.05)
@@ -189,7 +321,7 @@ def invite_targets_spam_worker():
                             except:
                                 pass
 
-                        # === 3. ব্যাজ জয়িন ===
+                        # Badge join
                         for badge_name, badge_value in BADGES.items():
                             try:
                                 badge_pkt = create_badge_join_packet(client.key, client.iv, target_id, badge_value)
@@ -240,7 +372,7 @@ def stop_invite_targets_spam():
     auto_spam_active = False
     return True, "Active targets spam stopped"
 
-# ==================== STATUS CHECKER FUNCTIONS ====================
+# ==================== CORE SPAM FUNCTIONS ====================
 def create_group_invite_packet(key, iv, target_uid, players=5, region="BD"):
     """Create group invite packet"""
     try:
@@ -297,13 +429,11 @@ def create_group_invite_packet(key, iv, target_uid, players=5, region="BD"):
         
         return bytes.fromhex(packet_type + padding + len_hex + encrypted)
     except Exception as e:
-        print(f"{R}❌ Group invite packet error: {e}{RS}")
         return None
 
 def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
-    """Create join request with badge using custom working avatars"""
+    """Create join request with badge"""
     try:
-        # xBunnEr list of working avatar IDs
         avatar_ids = [
             902000028, 902000011, 902000015, 902000013, 902000086,
             902000154, 902000127, 902000207, 902000246, 902000305,
@@ -337,7 +467,7 @@ def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
                 18: 312,
                 19: 46,
                 23: bytes([16, 1, 24, 1]),
-                24: selected_avatar, # এখানে xBunnEr এর অবতার আইডি ব্যবহার করা হয়েছে
+                24: selected_avatar,
                 26: "",
                 28: "",
                 31: {1: 1, 2: badge_value},
@@ -369,7 +499,6 @@ def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
         
         return bytes.fromhex(packet_type + padding + len_hex + encrypted)
     except Exception as e:
-        print(f"{R}❌ Badge join packet error: {e}{RS}")
         return None
 
 def encode_varint_sync(value: int) -> bytes:
@@ -410,8 +539,7 @@ def create_proto_sync(fields):
             
     return bytes(packet)
 
-async def OpEnSq(K , V, region):
-    # Field 14 এর ভেতর আপনার দেওয়া Game Mode 46 সেট করা হয়েছে
+async def OpEnSq(K, V, region="BD"):
     fields = {
         1: 1, 
         2: {
@@ -423,7 +551,7 @@ async def OpEnSq(K , V, region):
             11: 1, 
             13: 1, 
             14: {
-                1: 46,      # আপনার দেওয়া Game Mode ID
+                1: 46,
                 2: 1393, 
                 6: 11, 
                 8: "1.120.2", 
@@ -438,19 +566,18 @@ async def OpEnSq(K , V, region):
         packet = "0519"
     else:
         packet = "0515"
-    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet, K, V)
 
-async def cHSq(Nu , Uid , K , V, region):
-    # Field 4 এ 46 এবং Field 8 এ 12 সেট করা হয়েছে (আপনার প্যাকেট অনুযায়ী)
+async def cHSq(Nu, Uid, K, V, region="BD"):
     fields = {
         1: 17, 
         2: {
             1: int(Uid), 
             2: 1, 
             3: int(Nu - 1), 
-            4: 46,      # Game ID: 46
+            4: 46,
             5: "\x1a", 
-            8: 12,      # Match ID: 12 (Craftland Specific)
+            8: 12,
             13: 330
         }
     }
@@ -460,9 +587,9 @@ async def cHSq(Nu , Uid , K , V, region):
         packet = "0519"
     else:
         packet = "0515"
-    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet, K, V)
 
-async def SEnd_InV(Nu, Uid, K, V, region):
+async def SEnd_InV(Nu, Uid, K, V, region="BD"):
     fields = {
         1: 2,
         2: {
@@ -471,16 +598,30 @@ async def SEnd_InV(Nu, Uid, K, V, region):
             4: int(Nu)
         }
     }
-    packet = '0514' if region.lower() == "BD" else "0515"
+    packet = '0514' if region.lower() == "bd" else "0515"
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet, K, V)
 
 async def ExiT(K, V):
     fields = {1: 7, 2: {1: 0}}
     return await _pk((await _pb(fields)).hex(), '0515', K, V)
 
-# ==================== ENHANCED SPAM WORKER (MULTI-TARGET) ====================
+async def GeneRaTePk(data, pak, K, V):
+    encrypted = EnC_PacKeT(data, K, V)
+    length = len(encrypted) // 2
+    len_hex = DecodE_HeX(length)
+    padding_map = {2: "000000", 3: "00000", 4: "0000", 5: "000"}
+    padding = padding_map.get(len(len_hex), "000")
+    return bytes.fromhex(pak + padding + len_hex + encrypted)
+
+async def _pb(fields):
+    return create_proto_sync(fields)
+
+async def _pk(data, pak, K, V):
+    return await GeneRaTePk(data, pak, K, V)
+
+# ==================== SPAM WORKER ====================
 def spam_worker_multi(targets_list):
-    """একাধিক টার্গেটে একসাথে স্প্যাম করার জন্য ওয়ার্কার"""
+    """একাধিক টার্গেটে স্প্যাম"""
     print(f"\n{G}{'='*60}{RS}")
     print(f"{G}🎯 MULTI-TARGET SPAM STARTED ON {len(targets_list)} TARGETS:{RS}")
     for tid in targets_list:
@@ -527,7 +668,7 @@ def spam_worker_multi(targets_list):
 
                 try:
                     if hasattr(client, 'CliEnts2') and client.key:
-                        # === 1. রুম স্প্যাম ===
+                        # Room spam
                         try:
                             open_pkt = openroom(client.key, client.iv)
                             if open_pkt:
@@ -540,16 +681,16 @@ def spam_worker_multi(targets_list):
                         except:
                             pass
 
-                        # === 2. গ্রুপ ইনভাইট (5 প্লেয়ার) ===
+                        # Group invites
                         try:
                             async def send_invite_5():
-                                p1 = await OpEnSq(client.key, client.iv)
+                                p1 = await OpEnSq(client.key, client.iv, "BD")
                                 client.CliEnts2.send(p1)
                                 await asyncio.sleep(0.05)
-                                p2 = await cHSq(5, target_id, client.key, client.iv)
+                                p2 = await cHSq(5, target_id, client.key, client.iv, "BD")
                                 client.CliEnts2.send(p2)
                                 await asyncio.sleep(0.05)
-                                p3 = await SEnd_InV(5, target_id, client.key, client.iv)
+                                p3 = await SEnd_InV(5, target_id, client.key, client.iv, "BD")
                                 client.CliEnts2.send(p3)
                                 total_requests += 1
                                 await asyncio.sleep(0.05)
@@ -559,7 +700,7 @@ def spam_worker_multi(targets_list):
                         except:
                             pass
 
-                        # === 3. ব্যাজ জয়িন ===
+                        # Badge join
                         for badge_name, badge_value in BADGES.items():
                             try:
                                 badge_pkt = create_badge_join_packet(client.key, client.iv, target_id, badge_value)
@@ -570,7 +711,7 @@ def spam_worker_multi(targets_list):
                             except:
                                 pass
 
-                        # === 4. 3 প্লেয়ার গ্রুপ ইনভাইট ===
+                        # 3 player group
                         try:
                             group_pkt_3 = create_group_invite_packet(client.key, client.iv, target_id, 3)
                             if group_pkt_3:
@@ -580,7 +721,7 @@ def spam_worker_multi(targets_list):
                         except:
                             pass
 
-                        # === 5. 6 প্লেয়ার গ্রুপ ইনভাইট ===
+                        # 6 player group
                         try:
                             group_pkt_6 = create_group_invite_packet(client.key, client.iv, target_id, 6)
                             if group_pkt_6:
@@ -636,7 +777,7 @@ def start_multi_spam(targets_list):
             for tid in new_targets:
                 spam_threads[tid] = thread
         thread.start()
-        return True, f"Started spam on {len(new_targets)} targets: {', '.join(new_targets)}"
+        return True, f"Started spam on {len(new_targets)} targets"
     return False, "No new targets to start"
 
 def stop_spam(target_id):
@@ -657,8 +798,17 @@ def stop_all_spam():
             del active_power_targets[target]
     return True, f"Stopped all spam ({len(targets)} targets)"
 
-def get_status():
-    """বর্তমান স্প্যাম স্ট্যাটাস পাওয়া"""
+def start_spam(uid, spam_type='full'):
+    """Start spam on a single target"""
+    if spam_type == 'squad':
+        # Squad spam only
+        return start_multi_spam([uid])
+    else:
+        # Full spam
+        return start_multi_spam([uid])
+
+def get_spam_status():
+    """Get current spam status"""
     with active_power_lock:
         active_targets = list(active_power_targets.keys())
         targets_info = []
@@ -668,55 +818,65 @@ def get_status():
             elapsed = (datetime.now() - start_time).total_seconds() if start_time else 0
             targets_info.append({
                 'uid': target,
-                'elapsed_minutes': int(elapsed / 60)
+                'elapsed_minutes': int(elapsed / 60),
+                'type': 'full'
             })
     
     with connected_clients_lock:
         accounts_count = len(connected_clients)
         accounts_list = list(connected_clients.keys())
     
-    with smart_monitor_lock:
-        monitored_targets = [
-            {'uid': uid, 'status': smart_target_statuses.get(uid, 'CHECKING...')} 
-            for uid in smart_monitor_threads.keys()
-        ]
-    
     return {
         'active_targets': targets_info,
         'active_count': len(active_targets),
         'accounts_count': accounts_count,
         'accounts_list': accounts_list[:50],
-        'auto_uids': auto_uids,
         'invite_uids': invite_uids,
-        'auto_active': auto_spam_active,
-        'smart_monitored': monitored_targets
+        'auto_active': auto_spam_active
     }
+
+def trigger_manual_reset():
+    """Manually trigger auto reset"""
+    global refresh_timer
+    print(f"{Y}🔄 Manual reset triggered{RS}")
+    stop_all_spam()
+    stop_invite_targets_spam()
+    
+    # Reload files
+    load_invite_uids()
+    load_auto_uids()
+    
+    # Restart spam
+    if invite_uids:
+        start_invite_targets_spam()
+    
+    # Restart monitor
+    for uid in auto_uids:
+        start_smart_monitor(uid)
+    
+    # Reset timer
+    if refresh_timer:
+        refresh_timer.cancel()
+    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
+    refresh_timer.daemon = True
+    refresh_timer.start()
+    
+    return True, "Manual reset completed"
 
 # ==================== AUTO REFRESH ====================
 def auto_refresh_and_restart():
-    """প্রতি ৭ মিনিটে রিফ্রেশ - কিন্তু ACTIVE TARGETS অফ হবে না"""
+    """প্রতি ৭ মিনিটে রিফ্রেশ"""
     global auto_spam_active, refresh_timer
     
     print(f"\n{Y}{'='*50}{RS}")
-    print(f"{Y}🔄 AUTO REFRESH INITIATED (KEEPING ACTIVE TARGETS){RS}")
+    print(f"{Y}🔄 AUTO REFRESH INITIATED{RS}")
     print(f"{Y}{'='*50}{RS}\n")
     
-    # আগে এখানে stop_all_spam() ছিল, যা এখন সরিয়ে দেওয়া হয়েছে।
-    # এর ফলে বর্তমানে যা চলছে তা বন্ধ হবে না।
-
-    # ফাইল থেকে নতুন UID গুলো লোড করা (যদি আপনি ফাইলে নতুন কিছু লিখে থাকেন)
-    load_auto_uids()
+    # Reload files
     load_invite_uids()
+    load_auto_uids()
     
-    # SMART MONITORED (auto_uid.txt) - শুধুমাত্র নতুন UID গুলো যোগ করা হবে
-    if auto_uids:
-        print(f"{G}🧠 Checking for new SMART monitor targets...{RS}")
-        for uid in auto_uids:
-            with smart_monitor_lock:
-                if uid not in smart_monitor_threads:
-                    start_smart_monitor(uid)
-    
-    # ACTIVE TARGETS (inv_uid.txt) - যদি স্প্যাম থ্রেড বন্ধ থাকে তবেই চালু করবে
+    # Restart spam if not running
     if invite_uids:
         if not invite_spam_thread or not invite_spam_thread.is_alive():
             print(f"{G}🎯 Starting ACTIVE TARGETS worker...{RS}")
@@ -724,7 +884,13 @@ def auto_refresh_and_restart():
         else:
             print(f"{G}✅ ACTIVE TARGETS worker is already running.{RS}")
     
-    # টাইমার রিসেট করা
+    # Start smart monitors
+    for uid in auto_uids:
+        with smart_monitor_lock:
+            if uid not in smart_monitor_threads:
+                start_smart_monitor(uid)
+    
+    # Reset timer
     if refresh_timer:
         refresh_timer.cancel()
     refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
@@ -751,6 +917,8 @@ def load_accounts_from_file(filename="accs.txt"):
         if not os.path.exists(filename):
             with open(filename, "w") as f:
                 f.write(f"# Format: UID:PASSWORD\n")
+                f.write(f"# Example:\n")
+                f.write(f"# 5435051601:your_password_here\n")
             return []
 
         with open(filename, "r", encoding="utf-8") as file:
@@ -760,7 +928,7 @@ def load_accounts_from_file(filename="accs.txt"):
                     if ":" in line:
                         parts = line.split(":")
                         uid = parts[0].strip()
-                        pwd = parts[1].strip()
+                        pwd = parts[1].strip() if len(parts) > 1 else ""
                     else:
                         uid = line.strip()
                         pwd = ""
@@ -783,6 +951,8 @@ class FF_CLient():
         self.password = password
         self.key = None
         self.iv = None
+        self.max_retries = 3
+        self.retry_count = 0
         self.Get_FiNal_ToKen_0115()
 
     def Connect_SerVer_OnLine(self, Token, tok, host, port, key, iv, host2, port2):
@@ -843,17 +1013,25 @@ class FF_CLient():
                 self.Connect_SerVer(Token, tok, host, port, key, iv, host2, port2)
                                     
     def GeT_Key_Iv(self, serialized_data):
-        my_message = xKEys.MyMessage()
-        my_message.ParseFromString(serialized_data)
-        timestamp, key, iv = my_message.field21, my_message.field22, my_message.field23
-        timestamp_obj = Timestamp()
-        timestamp_obj.FromNanoseconds(timestamp)
-        timestamp_seconds = timestamp_obj.seconds
-        timestamp_nanos = timestamp_obj.nanos
-        combined_timestamp = timestamp_seconds * 1_000_000_000 + timestamp_nanos
-        return combined_timestamp, key, iv    
+        try:
+            my_message = xKEys.MyMessage()
+            my_message.ParseFromString(serialized_data)
+            timestamp, key, iv = my_message.field21, my_message.field22, my_message.field23
+            timestamp_obj = Timestamp()
+            timestamp_obj.FromNanoseconds(timestamp)
+            timestamp_seconds = timestamp_obj.seconds
+            timestamp_nanos = timestamp_obj.nanos
+            combined_timestamp = timestamp_seconds * 1_000_000_000 + timestamp_nanos
+            return combined_timestamp, key, iv
+        except Exception as e:
+            print(f"{R}❌ Key/IV extraction error: {e}{RS}")
+            return None, None, None
 
     def Guest_GeneRaTe(self, uid, password):
+        if not password:
+            print(f"{Y}⚠️ No password for {uid}, skipping...{RS}")
+            return None
+            
         self.url = "https://100067.connect.garena.com/oauth/guest/token/grant"
         self.headers = {
             "Host": "100067.connect.garena.com",
@@ -871,15 +1049,29 @@ class FF_CLient():
             "client_id": "100067",
         }
         try:
-            self.response = requests.post(self.url, headers=self.headers, data=self.dataa).json()
-            self.Access_ToKen, self.Access_Uid = self.response['access_token'], self.response['open_id']
+            response = requests.post(self.url, headers=self.headers, data=self.dataa)
+            if response.status_code != 200:
+                print(f"{R}❌ Login failed {self.id}: HTTP {response.status_code}{RS}")
+                return None
+                
+            self.response = response.json()
+            
+            # Check if response has required keys
+            if 'access_token' not in self.response:
+                print(f"{R}❌ Login error {self.id}: {self.response.get('error', 'Unknown error')}{RS}")
+                return None
+                
+            self.Access_ToKen = self.response['access_token']
+            self.Access_Uid = self.response.get('open_id', uid)
             time.sleep(0.2)
-            print(f'{C}🔐 Login: {self.id}{RS}')
+            print(f'{C}🔐 Login success: {self.id}{RS}')
             return self.ToKen_GeneRaTe(self.Access_ToKen, self.Access_Uid)
+        except requests.exceptions.RequestException as e:
+            print(f"{R}❌ Network error {self.id}: {e}{RS}")
+            return None
         except Exception as e: 
             print(f"{R}❌ Login error {self.id}: {e}{RS}")
-            time.sleep(10)
-            return self.Guest_GeneRaTe(uid, password)
+            return None
                                         
     def GeT_LoGin_PorTs(self, JwT_ToKen, PayLoad, dynamic_url="https://clientbp.ggpolarbear.com"):
         self.UrL = f'{dynamic_url}/GetLoginData'
@@ -895,7 +1087,11 @@ class FF_CLient():
             'Accept-Encoding': 'deflate, gzip',
         }        
         try:
-            self.Res = requests.post(self.UrL, headers=self.HeadErs, data=PayLoad, verify=False)
+            self.Res = requests.post(self.UrL, headers=self.HeadErs, data=PayLoad, verify=False, timeout=10)
+            if self.Res.status_code != 200:
+                print(f"{R}❌ Failed to get ports: HTTP {self.Res.status_code}{RS}")
+                return None, None, None, None
+                
             self.BesTo_data = json.loads(DeCode_PackEt(self.Res.content.hex()))  
             address, address2 = self.BesTo_data['32']['data'], self.BesTo_data['14']['data'] 
             ip, ip2 = address[:len(address) - 6], address2[:len(address2) - 6]
@@ -919,12 +1115,11 @@ class FF_CLient():
         }
 
         try:
-            # --- প্রোটোবাফ ডাটা তৈরি ---
             major_login = MajoRLoGinrEq_pb2.MajorLogin()
             major_login.event_time = str(datetime.now())[:-7]
             major_login.game_name = "free fire"
             major_login.platform_id = 2
-            major_login.client_version = "1.126.7" # এখানে আপনার ভার্সনটি দিন
+            major_login.client_version = "1.126.7"
             major_login.client_version_code = "2024010012"
             major_login.system_software = "Android OS 11 / API-30 (RQ3A.210805.001)"
             major_login.system_hardware = "Handheld"
@@ -941,7 +1136,7 @@ class FF_CLient():
             major_login.gpu_renderer = "Adreno (TM) 650"
             major_login.gpu_version = "OpenGL ES 3.2 V@1.50"
             major_login.graphics_api = "OpenGLES3"
-            major_login.unique_device_id = "Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57"
+            major_login.unique_device_id = f"Google|{random.randint(10000000, 99999999)}-{random.randint(1000, 9999)}"
             major_login.language = "en"
             major_login.open_id = Access_Uid
             major_login.open_id_type = "4"
@@ -977,7 +1172,6 @@ class FF_CLient():
             major_login.cpu_architecture = "64"
             major_login.android_engine_init_flag = 110009
 
-            # সিরিয়ালাইজ এবং এনক্রিপশন
             raw_data = major_login.SerializeToString()
             key = b'Yg&tc%DEuh6%Zc^8'
             iv = b'6oyZDr22E3ychjM%'
@@ -985,82 +1179,106 @@ class FF_CLient():
             self.PaYload = cipher.encrypt(pad(raw_data, 16))
 
         except Exception as e:
-            print(f"{R}❌ Protobuf building error: {e}{RS}")
-            time.sleep(5)
-            return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
+            print(f"{R}❌ Protobuf building error {self.id}: {e}{RS}")
+            return None
 
-        # সার্ভারে রিকোয়েস্ট পাঠানো
-        self.ResPonse = requests.post(self.UrL, headers=self.HeadErs, data=self.PaYload, verify=False)        
-        
-        if self.ResPonse.status_code == 200:
-            try:
-                # রেসপন্স ডিকোড করা
-                self.BesTo_data = json.loads(DeCode_PackEt(self.ResPonse.content.hex()))
-                self.JwT_ToKen = self.BesTo_data['8']['data']           
-                self.combined_timestamp, self.key, self.iv = self.GeT_Key_Iv(self.ResPonse.content)
-                ip, port, ip2, port2 = self.GeT_LoGin_PorTs(self.JwT_ToKen, self.PaYload)            
-                return self.JwT_ToKen, self.key, self.iv, self.combined_timestamp, ip, port, ip2, port2
-            except Exception as e:
-                print(f"{R}❌ Response parsing error: {e}{RS}")
-                time.sleep(5)
-                return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
-        else:
-            print(f"{R}❌ Token generation error, status: {self.ResPonse.status_code}{RS}")
-            time.sleep(5)
-            return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
+        try:
+            self.ResPonse = requests.post(self.UrL, headers=self.HeadErs, data=self.PaYload, verify=False, timeout=15)
+            
+            if self.ResPonse.status_code == 200:
+                try:
+                    self.BesTo_data = json.loads(DeCode_PackEt(self.ResPonse.content.hex()))
+                    if '8' not in self.BesTo_data or 'data' not in self.BesTo_data['8']:
+                        print(f"{R}❌ Invalid response format {self.id}{RS}")
+                        return None
+                        
+                    self.JwT_ToKen = self.BesTo_data['8']['data']           
+                    combined_timestamp, key, iv = self.GeT_Key_Iv(self.ResPonse.content)
+                    if not all([key, iv]):
+                        print(f"{R}❌ Failed to extract key/iv {self.id}{RS}")
+                        return None
+                        
+                    ip, port, ip2, port2 = self.GeT_LoGin_PorTs(self.JwT_ToKen, self.PaYload)
+                    if not all([ip, port, ip2, port2]):
+                        print(f"{R}❌ Failed to get ports {self.id}{RS}")
+                        return None
+                        
+                    return self.JwT_ToKen, key, iv, combined_timestamp, ip, port, ip2, port2
+                except Exception as e:
+                    print(f"{R}❌ Response parsing error {self.id}: {e}{RS}")
+                    return None
+            else:
+                print(f"{R}❌ Token generation error {self.id}, status: {self.ResPonse.status_code}{RS}")
+                return None
+        except Exception as e:
+            print(f"{R}❌ Request error {self.id}: {e}{RS}")
+            return None
       
     def Get_FiNal_ToKen_0115(self):
-        try:
-            result = self.Guest_GeneRaTe(self.id, self.password)
-            if not result:
-                print(f"{Y}⚠️ Failed to get token {self.id}, retrying...{RS}")
-                time.sleep(5)
-                return self.Get_FiNal_ToKen_0115()
-                
-            token, key, iv, Timestamp, ip, port, ip2, port2 = result
-            
-            if not all([ip, port, ip2, port2]):
-                print(f"{Y}⚠️ Failed to get ports {self.id}, retrying...{RS}")
-                time.sleep(5)
-                return self.Get_FiNal_ToKen_0115()
-                
-            self.JwT_ToKen = token        
+        while self.retry_count < self.max_retries:
             try:
-                self.AfTer_DeC_JwT = jwt.decode(token, options={"verify_signature": False})
-                self.AccounT_Uid = self.AfTer_DeC_JwT.get('account_id')
-                self.EncoDed_AccounT = hex(self.AccounT_Uid)[2:]
-                self.HeX_VaLue = DecodE_HeX(Timestamp)
-                self.TimE_HEx = self.HeX_VaLue
-                self.JwT_ToKen_ = token.encode().hex()
-                print(f'{C}🆔 Account UID: {self.AccounT_Uid}{RS}')
-            except Exception as e:
-                print(f"{R}❌ Token decode error {self.id}: {e}{RS}")
-                time.sleep(5)
-                return self.Get_FiNal_ToKen_0115()
+                result = self.Guest_GeneRaTe(self.id, self.password)
+                if not result:
+                    self.retry_count += 1
+                    wait_time = self.retry_count * 5
+                    print(f"{Y}⚠️ Retry {self.retry_count}/{self.max_retries} for {self.id} in {wait_time}s{RS}")
+                    time.sleep(wait_time)
+                    continue
+                    
+                token, key, iv, Timestamp, ip, port, ip2, port2 = result
                 
-            try:
-                self.Header = hex(len(EnC_PacKeT(self.JwT_ToKen_, key, iv)) // 2)[2:]
-                length = len(self.EncoDed_AccounT)
-                self.__ = '00000000'
-                if length == 9: self.__ = '0000000'
-                elif length == 8: self.__ = '00000000'
-                elif length == 10: self.__ = '000000'
-                elif length == 7: self.__ = '000000000'
-                self.Header = f'0115{self.__}{self.EncoDed_AccounT}{self.TimE_HEx}00000{self.Header}'
-                self.FiNal_ToKen_0115 = self.Header + EnC_PacKeT(self.JwT_ToKen_, key, iv)
-            except Exception as e:
-                print(f"{R}❌ Final token error {self.id}: {e}{RS}")
-                time.sleep(5)
-                return self.Get_FiNal_ToKen_0115()
+                if not all([ip, port, ip2, port2]):
+                    self.retry_count += 1
+                    time.sleep(self.retry_count * 3)
+                    continue
+                    
+                self.JwT_ToKen = token        
+                try:
+                    self.AfTer_DeC_JwT = jwt.decode(token, options={"verify_signature": False})
+                    self.AccounT_Uid = self.AfTer_DeC_JwT.get('account_id')
+                    if not self.AccounT_Uid:
+                        self.AccounT_Uid = self.id
+                    self.EncoDed_AccounT = hex(self.AccounT_Uid)[2:]
+                    self.HeX_VaLue = DecodE_HeX(Timestamp)
+                    self.TimE_HEx = self.HeX_VaLue
+                    self.JwT_ToKen_ = token.encode().hex()
+                    print(f'{C}🆔 Account UID: {self.AccounT_Uid}{RS}')
+                except Exception as e:
+                    print(f"{R}❌ Token decode error {self.id}: {e}{RS}")
+                    self.retry_count += 1
+                    time.sleep(self.retry_count * 3)
+                    continue
+                    
+                try:
+                    self.Header = hex(len(EnC_PacKeT(self.JwT_ToKen_, key, iv)) // 2)[2:]
+                    length = len(self.EncoDed_AccounT)
+                    self.__ = '00000000'
+                    if length == 9: self.__ = '0000000'
+                    elif length == 8: self.__ = '00000000'
+                    elif length == 10: self.__ = '000000'
+                    elif length == 7: self.__ = '000000000'
+                    self.Header = f'0115{self.__}{self.EncoDed_AccounT}{self.TimE_HEx}00000{self.Header}'
+                    self.FiNal_ToKen_0115 = self.Header + EnC_PacKeT(self.JwT_ToKen_, key, iv)
+                except Exception as e:
+                    print(f"{R}❌ Final token error {self.id}: {e}{RS}")
+                    self.retry_count += 1
+                    time.sleep(self.retry_count * 3)
+                    continue
+                    
+                self.AutH_ToKen = self.FiNal_ToKen_0115
+                self.Connect_SerVer(self.JwT_ToKen, self.AutH_ToKen, ip, port, key, iv, ip2, port2)
+                self.retry_count = 0
+                return self.AutH_ToKen, key, iv
                 
-            self.AutH_ToKen = self.FiNal_ToKen_0115
-            self.Connect_SerVer(self.JwT_ToKen, self.AutH_ToKen, ip, port, key, iv, ip2, port2)        
-            return self.AutH_ToKen, key, iv
-            
-        except Exception as e:
-            print(f"{R}❌ {self.id} connection failed: {e}{RS}")
-            time.sleep(5)
-            return self.Get_FiNal_ToKen_0115()
+            except Exception as e:
+                print(f"{R}❌ {self.id} connection failed: {e}{RS}")
+                self.retry_count += 1
+                time.sleep(self.retry_count * 5)
+                
+        print(f"{R}❌ {self.id} failed after {self.max_retries} retries{RS}")
+        return None, None, None
+
+
 
 def start_account(account):
     try:
@@ -1096,14 +1314,17 @@ def logout():
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-# ==================== API ROUTES (GET with Password) ====================
+# ==================== API ROUTES ====================
 
-# GET API - Full Spam (with password in query)
-@app.route('/api/spam/all', methods=['GET'])
-def api_get_full_spam():
-    """GET API: Start full spam on a target (room + squad + badge + group)"""
-    uid = request.args.get('uid')
-    password = request.args.get('pass')
+@app.route('/api/spam/all', methods=['GET', 'POST'])
+def api_spam_all():
+    password = request.args.get('pass') if request.method == 'GET' else None
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        uid = data.get('uid', '')
+        password = data.get('pass')
+    else:
+        uid = request.args.get('uid', '')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1114,23 +1335,15 @@ def api_get_full_spam():
     success, message = start_spam(uid, 'full')
     return jsonify({'success': success, 'message': message})
 
-# GET API - Full Spam (with UID in path) - for backward compatibility
-@app.route('/api/spam/all/<uid>', methods=['GET'])
-@login_required
-def api_get_full_spam_path(uid):
-    """GET API: Start full spam on a target (path parameter)"""
-    if not uid or not uid.isdigit():
-        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
-    
-    success, message = start_spam(uid, 'full')
-    return jsonify({'success': success, 'message': message})
-
-# GET API - Squad Spam (with password in query)
-@app.route('/api/spam/squad', methods=['GET'])
-def api_get_squad_spam():
-    """GET API: Start squad spam on a target (group invites only)"""
-    uid = request.args.get('uid')
-    password = request.args.get('pass')
+@app.route('/api/spam/squad', methods=['GET', 'POST'])
+def api_spam_squad():
+    password = request.args.get('pass') if request.method == 'GET' else None
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        uid = data.get('uid', '')
+        password = data.get('pass')
+    else:
+        uid = request.args.get('uid', '')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1141,23 +1354,15 @@ def api_get_squad_spam():
     success, message = start_spam(uid, 'squad')
     return jsonify({'success': success, 'message': message})
 
-# GET API - Squad Spam (with UID in path)
-@app.route('/api/spam/squad/<uid>', methods=['GET'])
-@login_required
-def api_get_squad_spam_path(uid):
-    """GET API: Start squad spam on a target (path parameter)"""
-    if not uid or not uid.isdigit():
-        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
-    
-    success, message = start_spam(uid, 'squad')
-    return jsonify({'success': success, 'message': message})
-
-# GET API - Stop Spam (with password in query)
-@app.route('/api/stop', methods=['GET'])
-def api_get_stop_spam():
-    """GET API: Stop spam on a target"""
-    uid = request.args.get('uid')
-    password = request.args.get('pass')
+@app.route('/api/stop', methods=['GET', 'POST'])
+def api_stop():
+    password = request.args.get('pass') if request.method == 'GET' else None
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        uid = data.get('uid', '')
+        password = data.get('pass')
+    else:
+        uid = request.args.get('uid', '')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1168,22 +1373,12 @@ def api_get_stop_spam():
     success, message = stop_spam(uid)
     return jsonify({'success': success, 'message': message})
 
-# GET API - Stop Spam (with UID in path)
-@app.route('/api/stop/<uid>', methods=['GET'])
-@login_required
-def api_get_stop_spam_path(uid):
-    """GET API: Stop spam on a target (path parameter)"""
-    if not uid or not uid.isdigit():
-        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
-    
-    success, message = stop_spam(uid)
-    return jsonify({'success': success, 'message': message})
-
-# GET API - Stop All (with password in query)
-@app.route('/api/stop-all', methods=['GET'])
-def api_get_stop_all():
-    """GET API: Stop all spam"""
-    password = request.args.get('pass')
+@app.route('/api/stop-all', methods=['GET', 'POST'])
+def api_stop_all():
+    password = request.args.get('pass') if request.method == 'GET' else None
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        password = data.get('pass')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1191,38 +1386,17 @@ def api_get_stop_all():
     success, message = stop_all_spam()
     return jsonify({'success': success, 'message': message})
 
-# GET API - Stop All (session based)
-@app.route('/api/stop-all', methods=['GET'])
-@login_required
-def api_get_stop_all_session():
-    """GET API: Stop all spam (session based)"""
-    success, message = stop_all_spam()
-    return jsonify({'success': success, 'message': message})
-
-# GET API - Status (with password in query)
 @app.route('/api/status', methods=['GET'])
-def api_get_status():
-    """GET API: Get spam status"""
+def api_status():
     password = request.args.get('pass')
-    
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
     
     return jsonify({'success': True, 'data': get_spam_status()})
 
-# GET API - Status (session based)
-@app.route('/api/status', methods=['GET'])
-@login_required
-def api_get_status_session():
-    """GET API: Get spam status (session based)"""
-    return jsonify({'success': True, 'data': get_spam_status()})
-
-# GET API - Accounts (with password in query)
 @app.route('/api/accounts', methods=['GET'])
-def api_get_accounts():
-    """GET API: Get connected accounts"""
+def api_accounts():
     password = request.args.get('pass')
-    
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
     
@@ -1230,20 +1404,12 @@ def api_get_accounts():
         accounts = list(connected_clients.keys())
     return jsonify({'success': True, 'accounts': accounts})
 
-# GET API - Accounts (session based)
-@app.route('/api/accounts', methods=['GET'])
-@login_required
-def api_get_accounts_session():
-    """GET API: Get connected accounts (session based)"""
-    with connected_clients_lock:
-        accounts = list(connected_clients.keys())
-    return jsonify({'success': True, 'accounts': accounts})
-
-# GET API - Reset (with password in query)
-@app.route('/api/reset', methods=['GET'])
-def api_get_reset():
-    """GET API: Manually trigger auto reset"""
-    password = request.args.get('pass')
+@app.route('/api/reset', methods=['GET', 'POST'])
+def api_reset():
+    password = request.args.get('pass') if request.method == 'GET' else None
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        password = data.get('pass')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1251,97 +1417,7 @@ def api_get_reset():
     success, message = trigger_manual_reset()
     return jsonify({'success': success, 'message': message})
 
-# GET API - Reset (session based)
-@app.route('/api/reset', methods=['GET'])
-@login_required
-def api_get_reset_session():
-    """GET API: Manually trigger auto reset (session based)"""
-    success, message = trigger_manual_reset()
-    return jsonify({'success': success, 'message': message})
-
-# ==================== API ROUTES (POST) ====================
-
-# POST API - Full Spam
-@app.route('/api/spam/all', methods=['POST'])
-@login_required
-def api_post_full_spam():
-    """POST API: Start full spam on target(s)"""
-    data = request.get_json()
-    uid = data.get('uid', '').strip()
-    
-    if not uid or not uid.isdigit():
-        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
-    
-    if ',' in uid:
-        uids = [u.strip() for u in uid.split(',') if u.strip().isdigit()]
-    elif ' ' in uid:
-        uids = [u.strip() for u in uid.split() if u.strip().isdigit()]
-    else:
-        uids = [uid]
-    
-    results = []
-    for target in uids:
-        success, message = start_spam(target, 'full')
-        results.append({'uid': target, 'success': success, 'message': message})
-    
-    return jsonify({'success': True, 'results': results})
-
-# POST API - Squad Spam
-@app.route('/api/spam/squad', methods=['POST'])
-@login_required
-def api_post_squad_spam():
-    """POST API: Start squad spam on target(s)"""
-    data = request.get_json()
-    uid = data.get('uid', '').strip()
-    
-    if not uid or not uid.isdigit():
-        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
-    
-    if ',' in uid:
-        uids = [u.strip() for u in uid.split(',') if u.strip().isdigit()]
-    elif ' ' in uid:
-        uids = [u.strip() for u in uid.split() if u.strip().isdigit()]
-    else:
-        uids = [uid]
-    
-    results = []
-    for target in uids:
-        success, message = start_spam(target, 'squad')
-        results.append({'uid': target, 'success': success, 'message': message})
-    
-    return jsonify({'success': True, 'results': results})
-
-# POST API - Stop Spam
-@app.route('/api/stop', methods=['POST'])
-@login_required
-def api_post_stop_spam():
-    """POST API: Stop spam on a target"""
-    data = request.get_json()
-    uid = data.get('uid', '').strip()
-    
-    if not uid or not uid.isdigit():
-        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
-    
-    success, message = stop_spam(uid)
-    return jsonify({'success': success, 'message': message})
-
-# POST API - Stop All
-@app.route('/api/stop-all', methods=['POST'])
-@login_required
-def api_post_stop_all():
-    """POST API: Stop all spam"""
-    success, message = stop_all_spam()
-    return jsonify({'success': success, 'message': message})
-
-# POST API - Reset
-@app.route('/api/reset', methods=['POST'])
-@login_required
-def api_post_reset():
-    """POST API: Manually trigger auto reset"""
-    success, message = trigger_manual_reset()
-    return jsonify({'success': success, 'message': message})
-
-# ==================== HTML TEMPLATE ====================
+# ==================== HTML TEMPLATES ====================
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1484,7 +1560,6 @@ LOGIN_TEMPLATE = '''
 </html>
 '''
 
-# ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1584,12 +1659,11 @@ HTML_TEMPLATE = '''
         <div class="stats-grid">
             <div class="stat-card"><i class="fas fa-bullseye"></i><h3>ACTIVE TARGETS</h3><div class="value" id="activeCount">0</div></div>
             <div class="stat-card"><i class="fas fa-robot"></i><h3>BOT ACCOUNTS</h3><div class="value" id="botCount">0</div></div>
-            <div class="stat-card"><i class="fas fa-users"></i><h3>GROUP ACCOUNTS</h3><div class="value" id="groupCount">0</div></div>
-            <div class="stat-card"><i class="fas fa-clock"></i><h3>AUTO RESET</h3><div class="value" style="font-size:1.2rem;">2 HOURS</div></div>
+            <div class="stat-card"><i class="fas fa-users"></i><h3>INVITE TARGETS</h3><div class="value" id="inviteCount">0</div></div>
+            <div class="stat-card"><i class="fas fa-clock"></i><h3>AUTO RESET</h3><div class="value" style="font-size:1.2rem;">7 MINUTES</div></div>
         </div>
 
         <div class="controls-grid">
-            <!-- Full Spam Control -->
             <div class="control-card">
                 <h3><i class="fas fa-fire"></i> FULL SPAM</h3>
                 <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Room + Squad + Badge + Group Invites</div>
@@ -1597,10 +1671,9 @@ HTML_TEMPLATE = '''
                     <input type="text" id="fullUid" placeholder="Target UID(s) (comma separated)">
                     <button class="btn btn-primary" onclick="startFullSpam()"><i class="fas fa-play"></i> START</button>
                 </div>
-                <div class="api-hint">GET: /api/spam/all/&lt;UID&gt; | POST: /api/spam/all</div>
+                <div class="api-hint">GET: /api/spam/all?uid=UID&pass=MAHIRJOD</div>
             </div>
 
-            <!-- Squad Spam Control -->
             <div class="control-card">
                 <h3><i class="fas fa-users"></i> SQUAD SPAM</h3>
                 <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Group Invites Only (3, 5, 6 Player)</div>
@@ -1608,12 +1681,11 @@ HTML_TEMPLATE = '''
                     <input type="text" id="squadUid" placeholder="Target UID(s) (comma separated)">
                     <button class="btn btn-success" onclick="startSquadSpam()"><i class="fas fa-play"></i> START</button>
                 </div>
-                <div class="api-hint">GET: /api/spam/squad/&lt;UID&gt; | POST: /api/spam/squad</div>
+                <div class="api-hint">GET: /api/spam/squad?uid=UID&pass=MAHIRJOD</div>
             </div>
         </div>
 
         <div class="controls-grid">
-            <!-- Stop Controls -->
             <div class="control-card">
                 <h3><i class="fas fa-stop"></i> STOP SPAM</h3>
                 <div class="input-group">
@@ -1624,21 +1696,19 @@ HTML_TEMPLATE = '''
                     <button class="btn btn-warning" onclick="stopAllSpam()" style="flex:1;"><i class="fas fa-stop-circle"></i> STOP ALL</button>
                     <button class="btn btn-purple" onclick="triggerReset()" style="flex:1;"><i class="fas fa-sync"></i> RESET NOW</button>
                 </div>
-                <div class="api-hint">GET: /api/stop/&lt;UID&gt; | GET: /api/stop-all | GET: /api/reset</div>
+                <div class="api-hint">GET: /api/stop?uid=UID&pass=MAHIRJOD | GET: /api/stop-all?pass=MAHIRJOD</div>
             </div>
 
-            <!-- File Info -->
             <div class="control-card">
                 <h3><i class="fas fa-file"></i> ACCOUNT FILES</h3>
                 <div style="background:rgba(0,0,0,0.3); padding:12px; border-radius:8px; font-size:0.85rem;">
-                    <div><span style="color:#00ffcc;">📁 accs.txt</span> <span id="accCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Room Spam</span></div>
-                    <div><span style="color:#ffaa00;">📁 group.txt</span> <span id="groupFileCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Squad Spam</span></div>
-                    <div style="font-size:0.7rem; color:rgba(255,255,255,0.2); margin-top:8px;">Place accounts in these files to enable spam</div>
+                    <div><span style="color:#00ffcc;">📁 accs.txt</span> <span id="accCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Bots</span></div>
+                    <div><span style="color:#ffaa00;">📁 inv_uid.txt</span> <span id="inviteFileCount" style="color:rgba(255,255,255,0.4);">0 targets</span> <span style="color:rgba(255,255,255,0.2);">→ Active Targets</span></div>
+                    <div style="font-size:0.7rem; color:rgba(255,255,255,0.2); margin-top:8px;">Place UIDs in inv_uid.txt for auto-spam</div>
                 </div>
             </div>
         </div>
 
-        <!-- Active Targets -->
         <div class="control-card" style="margin-bottom:30px;">
             <h3><i class="fas fa-list"></i> ACTIVE TARGETS</h3>
             <div id="activeList" class="active-list">
@@ -1646,16 +1716,14 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
-        <!-- Console -->
         <div class="control-card" style="margin-bottom:30px;">
             <h3><i class="fas fa-terminal"></i> CONSOLE</h3>
             <div class="console-box" id="consoleBox">
                 <div class="console-line"><span class="time">[System]</span> <span class="info">MAHIR SPAM ENGINE Initialized</span></div>
-                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset every 2 hours</span></div>
+                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset every 7 minutes</span></div>
             </div>
         </div>
 
-        <!-- Connected Accounts -->
         <div class="control-card">
             <h3><i class="fas fa-robot"></i> CONNECTED ACCOUNTS</h3>
             <div id="accountsContainer">
@@ -1664,12 +1732,11 @@ HTML_TEMPLATE = '''
         </div>
 
         <div class="footer">
-            MAHIR SYSTEM v3.0 | <i class="fas fa-code"></i> Engine by MAHIR | Auto Reset: 2 Hours
+            MAHIR SYSTEM v3.0 | <i class="fas fa-code"></i> Engine by MAHIR | Auto Reset: 7 Minutes
         </div>
     </div>
 
     <script>
-        // Matrix Background
         const canvas = document.getElementById('matrix-canvas');
         const ctx = canvas.getContext('2d');
         canvas.width = window.innerWidth;
@@ -1695,7 +1762,6 @@ HTML_TEMPLATE = '''
         }
         setInterval(drawMatrix, 50);
 
-        // Toast notifications
         function showToast(msg, type = 'info') {
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
@@ -1705,7 +1771,6 @@ HTML_TEMPLATE = '''
             setTimeout(() => toast.remove(), 4000);
         }
 
-        // Console log
         function logToConsole(msg, type = 'info') {
             const consoleBox = document.getElementById('consoleBox');
             const now = new Date();
@@ -1718,7 +1783,6 @@ HTML_TEMPLATE = '''
             if (consoleBox.children.length > 100) consoleBox.removeChild(consoleBox.children[0]);
         }
 
-        // Start Full Spam
         function startFullSpam() {
             const uid = document.getElementById('fullUid').value.trim();
             if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
@@ -1731,7 +1795,7 @@ HTML_TEMPLATE = '''
             fetch('/api/spam/all', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ uid: uid })
+                body: JSON.stringify({ uid: uid, pass: 'MAHIRJOD' })
             })
             .then(res => res.json())
             .then(data => {
@@ -1745,7 +1809,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Start Squad Spam
         function startSquadSpam() {
             const uid = document.getElementById('squadUid').value.trim();
             if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
@@ -1758,7 +1821,7 @@ HTML_TEMPLATE = '''
             fetch('/api/spam/squad', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ uid: uid })
+                body: JSON.stringify({ uid: uid, pass: 'MAHIRJOD' })
             })
             .then(res => res.json())
             .then(data => {
@@ -1772,7 +1835,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Stop Single Spam
         function stopSingleSpam() {
             const uid = document.getElementById('stopUid').value.trim();
             if (!uid) { showToast('Enter target UID to stop!', 'error'); return; }
@@ -1780,7 +1842,7 @@ HTML_TEMPLATE = '''
 
             logToConsole(`🛑 Stopping spam on ${uid}`, 'info');
             
-            fetch(`/api/stop/${uid}`)
+            fetch(`/api/stop?uid=${uid}&pass=MAHIRJOD`)
             .then(res => res.json())
             .then(data => {
                 if (data.success) {
@@ -1794,13 +1856,12 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Stop All Spam
         function stopAllSpam() {
             if (!confirm('⚠️ Stop all spam?')) return;
             
             logToConsole('🛑 Stopping ALL spam', 'info');
             
-            fetch('/api/stop-all')
+            fetch('/api/stop-all?pass=MAHIRJOD')
             .then(res => res.json())
             .then(data => {
                 if (data.success) {
@@ -1811,13 +1872,12 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Trigger Reset
         function triggerReset() {
-            if (!confirm('🔄 Manually trigger auto reset? This will stop all spam and reload accounts.')) return;
+            if (!confirm('🔄 Manually trigger auto reset?')) return;
             
             logToConsole('🔄 Triggering manual reset...', 'info');
             
-            fetch('/api/reset')
+            fetch('/api/reset?pass=MAHIRJOD')
             .then(res => res.json())
             .then(data => {
                 if (data.success) {
@@ -1828,7 +1888,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Refresh Status - পাসওয়ার্ড সহ
         function refreshStatus() {
             fetch('/api/status?pass=MAHIRJOD')
             .then(res => res.json())
@@ -1837,6 +1896,7 @@ HTML_TEMPLATE = '''
                     const status = data.data;
                     document.getElementById('activeCount').textContent = status.active_count || 0;
                     document.getElementById('botCount').textContent = status.accounts_count || 0;
+                    document.getElementById('inviteCount').textContent = (status.invite_uids || []).length;
             
                     const activeList = document.getElementById('activeList');
                     if (status.active_targets && status.active_targets.length > 0) {
@@ -1857,7 +1917,6 @@ HTML_TEMPLATE = '''
             })
             .catch(err => console.error('Status refresh error:', err));
 
-            // Refresh accounts - পাসওয়ার্ড সহ
             fetch('/api/accounts?pass=MAHIRJOD')
             .then(res => res.json())
             .then(data => {
@@ -1880,11 +1939,9 @@ HTML_TEMPLATE = '''
             stopSingleSpam();
         }
 
-        // Auto refresh every 5 seconds
         setInterval(refreshStatus, 5000);
         refreshStatus();
 
-        // Enter key support
         document.getElementById('fullUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startFullSpam(); });
         document.getElementById('squadUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startSquadSpam(); });
         document.getElementById('stopUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') stopSingleSpam(); });
@@ -1915,8 +1972,8 @@ def main():
     """)
     
     # Load files
-    load_auto_uids()
     load_invite_uids()
+    load_auto_uids()
     
     # Start accounts
     Thread(target=run_accounts, daemon=True).start()
@@ -1924,16 +1981,16 @@ def main():
     # Start auto refresh timer
     start_auto_refresh()
     
-    # Start auto spam
-    start_auto_spam()
+    # Start invite targets spam
+    if invite_uids:
+        start_invite_targets_spam()
+    
+    # Start smart monitors
+    for uid in auto_uids:
+        start_smart_monitor(uid)
     
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 if __name__ == "__main__":
-    try:
-        import aiohttp
-    except ImportError:
-        os.system("pip install aiohttp")
-    
     main()
