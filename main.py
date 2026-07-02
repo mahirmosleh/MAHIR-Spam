@@ -854,7 +854,7 @@ def trigger_manual_reset():
     # Reset timer
     if refresh_timer:
         refresh_timer.cancel()
-    refresh_timer = threading.Timer(2 * 60 * 60, auto_refresh_and_restart)
+    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
     refresh_timer.daemon = True
     refresh_timer.start()
     
@@ -890,7 +890,7 @@ def auto_refresh_and_restart():
     # Reset timer
     if refresh_timer:
         refresh_timer.cancel()
-    refresh_timer = threading.Timer(2 * 60 * 60, auto_refresh_and_restart)
+    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
     refresh_timer.daemon = True
     refresh_timer.start()
     
@@ -900,10 +900,10 @@ def start_auto_refresh():
     global refresh_timer
     if refresh_timer:
         refresh_timer.cancel()
-    refresh_timer = threading.Timer(2 * 60 * 60, auto_refresh_and_restart)
+    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
     refresh_timer.daemon = True
     refresh_timer.start()
-    print(f"{G}⏰ Auto-refresh timer started (EVERY 2 HOUR){RS}")
+    print(f"{G}⏰ Auto-refresh timer started (every 7 minutes){RS}")
 
 # ==================== ACCOUNTS ====================
 ACCOUNTS = []
@@ -1717,7 +1717,7 @@ HTML_TEMPLATE = '''
             <h3><i class="fas fa-terminal"></i> CONSOLE</h3>
             <div class="console-box" id="consoleBox">
                 <div class="console-line"><span class="time">[System]</span> <span class="info">MAHIR SPAM ENGINE Initialized</span></div>
-                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset EVERY 2 HOUR</span></div>
+                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset every 7 minutes</span></div>
             </div>
         </div>
 
