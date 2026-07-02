@@ -59,6 +59,10 @@ UPLOAD_FOLDER = "uploads"
 auto_reset_timer = None
 AUTO_RESET_INTERVAL = 2 * 60 * 60  # 2 hours in seconds
 
+# Account connection status
+accounts_initialized = False
+accounts_initializing = False
+
 # Create upload folder
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -631,7 +635,7 @@ def get_spam_status():
 # ==================== AUTO RESET ====================
 def auto_reset_spam():
     """Auto reset all spam every 2 hours"""
-    global auto_reset_timer
+    global auto_reset_timer, accounts_initialized
     
     print(f"\n{Y}{'='*50}{RS}")
     print(f"{Y}🔄 AUTO RESET INITIATED (Every 2 Hours){RS}")
@@ -640,12 +644,23 @@ def auto_reset_spam():
     # Stop all spam
     stop_all_spam()
     
+    # Clear connected clients
+    with connected_clients_lock:
+        connected_clients.clear()
+    
     # Reload accounts from files
     global ACCOUNTS, GROUP_ACCOUNTS
     ACCOUNTS = load_accounts(ACCOUNTS_FILE)
     GROUP_ACCOUNTS = load_group_accounts(GROUP_ACCOUNTS_FILE)
     
-    print(f"{G}✅ Auto reset complete. Accounts reloaded.{RS}\n")
+    # Reset initialization flag
+    accounts_initialized = False
+    
+    # Start accounts again
+    Thread(target=run_accounts, daemon=True).start()
+    Thread(target=run_group_accounts, daemon=True).start()
+    
+    print(f"{G}✅ Auto reset complete. Accounts reloaded and reconnected.{RS}\n")
     
     # Schedule next reset
     if auto_reset_timer:
@@ -966,7 +981,18 @@ def run_accounts_from_list(accounts):
 
 def run_accounts():
     """Run accounts from ACCOUNTS list"""
-    run_accounts_from_list(ACCOUNTS)
+    global accounts_initialized, accounts_initializing
+    
+    if accounts_initializing:
+        return
+    
+    accounts_initializing = True
+    
+    try:
+        run_accounts_from_list(ACCOUNTS)
+        accounts_initialized = True
+    finally:
+        accounts_initializing = False
 
 def run_group_accounts():
     """Run group accounts from GROUP_ACCOUNTS list"""
@@ -1027,6 +1053,10 @@ def upload_accs_file():
         # Update global ACCOUNTS
         ACCOUNTS = accounts
         
+        # Clear old connections and reconnect
+        with connected_clients_lock:
+            connected_clients.clear()
+        
         # Reconnect accounts
         Thread(target=run_accounts, daemon=True).start()
         
@@ -1070,6 +1100,14 @@ def upload_group_file():
         
         # Update global GROUP_ACCOUNTS
         GROUP_ACCOUNTS = accounts
+        
+        # Clear old connections and reconnect
+        with connected_clients_lock:
+            # Only remove group accounts from connected_clients
+            group_ids = [acc['id'] for acc in accounts]
+            for gid in group_ids:
+                if gid in connected_clients:
+                    del connected_clients[gid]
         
         # Reconnect group accounts
         Thread(target=run_group_accounts, daemon=True).start()
@@ -1138,6 +1176,10 @@ def upload_both_files():
     else:
         results['group'] = {'success': False, 'message': 'No file uploaded'}
     
+    # Clear all old connections
+    with connected_clients_lock:
+        connected_clients.clear()
+    
     # Start accounts if any uploaded
     if ACCOUNTS:
         Thread(target=run_accounts, daemon=True).start()
@@ -1177,7 +1219,8 @@ def get_accounts_count():
             'total_accounts': len(ACCOUNTS),
             'total_group_accounts': len(GROUP_ACCOUNTS),
             'connected_accounts': connected_count,
-            'active_targets': len(active_spam_targets)
+            'active_targets': len(active_spam_targets),
+            'initialized': accounts_initialized
         }
     })
 
@@ -1655,6 +1698,11 @@ HTML_TEMPLATE = '''
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
         .progress-bar { width: 100%; height: 4px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; margin-top: 10px; display: none; }
         .progress-bar .fill { height: 100%; background: linear-gradient(90deg, #ff007f, #7f00ff); border-radius: 4px; transition: width 0.3s; width: 0%; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .status-dot.online { background: #00ffcc; animation: pulse 1.5s infinite; }
+        .status-dot.offline { background: #ff4444; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+        .persist-status { font-size: 0.7rem; color: rgba(255,255,255,0.3); margin-top: 5px; }
         @media (max-width: 768px) { .controls-grid { grid-template-columns: 1fr; } .input-group { flex-direction: column; } .btn { width: 100%; justify-content: center; } .header { flex-direction: column; text-align: center; } }
     </style>
 </head>
@@ -1667,6 +1715,8 @@ HTML_TEMPLATE = '''
                 <div style="color: rgba(255,255,255,0.3); font-size:0.85rem;">SPAM CONTROL ENGINE v3.0</div>
             </div>
             <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <span class="status-dot online" id="statusDot"></span>
+                <span style="color:rgba(255,255,255,0.3); font-size:0.8rem;" id="statusText">Online</span>
                 <a href="/logout" class="btn btn-outline btn-sm"><i class="fas fa-sign-out-alt"></i> LOGOUT</a>
             </div>
         </div>
@@ -1715,7 +1765,7 @@ HTML_TEMPLATE = '''
                     <input type="text" id="fullUid" placeholder="Target UID(s) (comma separated)">
                     <button class="btn btn-primary" onclick="startFullSpam()"><i class="fas fa-play"></i> START</button>
                 </div>
-                <div class="api-hint">GET: /api/spam/all/&lt;UID&gt; | POST: /api/spam/all</div>
+                <div class="api-hint" style="font-size:0.65rem; color:rgba(255,255,255,0.3); margin-top:8px; font-family:monospace;">GET: /api/spam/all/&lt;UID&gt; | POST: /api/spam/all</div>
             </div>
 
             <!-- Squad Spam Control -->
@@ -1726,7 +1776,7 @@ HTML_TEMPLATE = '''
                     <input type="text" id="squadUid" placeholder="Target UID(s) (comma separated)">
                     <button class="btn btn-success" onclick="startSquadSpam()"><i class="fas fa-play"></i> START</button>
                 </div>
-                <div class="api-hint">GET: /api/spam/squad/&lt;UID&gt; | POST: /api/spam/squad</div>
+                <div class="api-hint" style="font-size:0.65rem; color:rgba(255,255,255,0.3); margin-top:8px; font-family:monospace;">GET: /api/spam/squad/&lt;UID&gt; | POST: /api/spam/squad</div>
             </div>
         </div>
 
@@ -1742,7 +1792,7 @@ HTML_TEMPLATE = '''
                     <button class="btn btn-warning" onclick="stopAllSpam()" style="flex:1;"><i class="fas fa-stop-circle"></i> STOP ALL</button>
                     <button class="btn btn-purple" onclick="triggerReset()" style="flex:1;"><i class="fas fa-sync"></i> RESET NOW</button>
                 </div>
-                <div class="api-hint">GET: /api/stop/&lt;UID&gt; | GET: /api/stop-all | GET: /api/reset</div>
+                <div class="api-hint" style="font-size:0.65rem; color:rgba(255,255,255,0.3); margin-top:8px; font-family:monospace;">GET: /api/stop/&lt;UID&gt; | GET: /api/stop-all | GET: /api/reset</div>
             </div>
 
             <!-- File Info -->
@@ -1755,6 +1805,7 @@ HTML_TEMPLATE = '''
                         <button class="btn btn-cyan btn-sm" onclick="downloadAccs()"><i class="fas fa-download"></i> Download accs.txt</button>
                         <button class="btn btn-cyan btn-sm" onclick="downloadGroup()"><i class="fas fa-download"></i> Download group.txt</button>
                     </div>
+                    <div class="persist-status"><i class="fas fa-database"></i> Accounts persist across page refresh</div>
                 </div>
             </div>
         </div>
@@ -1772,7 +1823,7 @@ HTML_TEMPLATE = '''
             <h3><i class="fas fa-terminal"></i> CONSOLE</h3>
             <div class="console-box" id="consoleBox">
                 <div class="console-line"><span class="time">[System]</span> <span class="info">MAHIR SPAM ENGINE Initialized</span></div>
-                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset every 2 hours</span></div>
+                <div class="console-line"><span class="time">[System]</span> <span class="info">Accounts persist across page refresh</span></div>
             </div>
         </div>
 
@@ -1785,7 +1836,7 @@ HTML_TEMPLATE = '''
         </div>
 
         <div class="footer">
-            MAHIR SYSTEM v3.0 | <i class="fas fa-code"></i> Engine by MAHIR | Auto Reset: 2 Hours
+            MAHIR SYSTEM v3.0 | <i class="fas fa-code"></i> Engine by MAHIR | Auto Reset: 2 Hours | <i class="fas fa-sync"></i> Persistent Sessions
         </div>
     </div>
 
@@ -1841,7 +1892,6 @@ HTML_TEMPLATE = '''
 
         // ========== FILE UPLOAD FUNCTIONS ==========
         
-        // Upload accs.txt
         function uploadAccsFile(file) {
             const formData = new FormData();
             formData.append('file', file);
@@ -1877,7 +1927,6 @@ HTML_TEMPLATE = '''
             });
         }
 
-        // Upload group.txt
         function uploadGroupFile(file) {
             const formData = new FormData();
             formData.append('file', file);
@@ -1959,7 +2008,6 @@ HTML_TEMPLATE = '''
 
         // ========== SPAM FUNCTIONS ==========
 
-        // Start Full Spam
         function startFullSpam() {
             const uid = document.getElementById('fullUid').value.trim();
             if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
@@ -1986,7 +2034,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Start Squad Spam
         function startSquadSpam() {
             const uid = document.getElementById('squadUid').value.trim();
             if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
@@ -2013,7 +2060,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Stop Single Spam
         function stopSingleSpam() {
             const uid = document.getElementById('stopUid').value.trim();
             if (!uid) { showToast('Enter target UID to stop!', 'error'); return; }
@@ -2035,7 +2081,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Stop All Spam
         function stopAllSpam() {
             if (!confirm('⚠️ Stop all spam?')) return;
             
@@ -2052,7 +2097,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Trigger Reset
         function triggerReset() {
             if (!confirm('🔄 Manually trigger auto reset? This will stop all spam and reload accounts.')) return;
             
@@ -2069,7 +2113,6 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
-        // Quick Stop
         function quickStop(uid) {
             document.getElementById('stopUid').value = uid;
             stopSingleSpam();
@@ -2078,6 +2121,27 @@ HTML_TEMPLATE = '''
         // ========== REFRESH STATUS ==========
 
         function refreshStatus() {
+            // Check if accounts are initialized
+            fetch('/api/accounts/count')
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    const dot = document.getElementById('statusDot');
+                    const text = document.getElementById('statusText');
+                    if (data.data.initialized) {
+                        dot.className = 'status-dot online';
+                        text.textContent = 'Online - Persistent';
+                    } else {
+                        dot.className = 'status-dot offline';
+                        text.textContent = 'Connecting...';
+                    }
+                    document.getElementById('accCount').textContent = data.data.total_accounts + ' accounts';
+                    document.getElementById('groupFileCount').textContent = data.data.total_group_accounts + ' accounts';
+                    document.getElementById('groupCount').textContent = data.data.total_group_accounts || 0;
+                }
+            })
+            .catch(err => console.error('Count refresh error:', err));
+
             fetch('/api/status?pass=MAHIRJOD')
             .then(res => res.json())
             .then(data => {
@@ -2105,7 +2169,6 @@ HTML_TEMPLATE = '''
             })
             .catch(err => console.error('Status refresh error:', err));
 
-            // Refresh accounts
             fetch('/api/accounts?pass=MAHIRJOD')
             .then(res => res.json())
             .then(data => {
@@ -2121,18 +2184,6 @@ HTML_TEMPLATE = '''
                 }
             })
             .catch(err => console.error('Accounts refresh error:', err));
-
-            // Get account counts
-            fetch('/api/accounts/count')
-            .then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    document.getElementById('accCount').textContent = data.data.total_accounts + ' accounts';
-                    document.getElementById('groupFileCount').textContent = data.data.total_group_accounts + ' accounts';
-                    document.getElementById('groupCount').textContent = data.data.total_group_accounts || 0;
-                }
-            })
-            .catch(err => console.error('Count refresh error:', err));
         }
 
         // Auto refresh every 5 seconds
@@ -2143,6 +2194,8 @@ HTML_TEMPLATE = '''
         document.getElementById('fullUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startFullSpam(); });
         document.getElementById('squadUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startSquadSpam(); });
         document.getElementById('stopUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') stopSingleSpam(); });
+
+        logToConsole('🔄 Accounts persist across page refresh - sessions are maintained', 'info');
     </script>
 </body>
 </html>
@@ -2150,6 +2203,8 @@ HTML_TEMPLATE = '''
 
 # ==================== MAIN ====================
 def main():
+    global accounts_initialized
+    
     print(f"""
     {C}{BOLD}
     ╔══════════════════════════════════════════════════════════════════════╗
@@ -2163,6 +2218,7 @@ def main():
     ║     ✅ Auto Reset: Every 2 Hours                                    ║
     ║     ✅ GET/POST API Support                                         ║
     ║     ✅ Web File Upload Support                                      ║
+    ║     ✅ Persistent Sessions (Accounts survive page refresh)           ║
     ║                                                                      ║
     ║     🌐 Web Panel: http://127.0.0.1:8080                            ║
     ║     🔑 Password: MAHIRJOD                                           ║
@@ -2171,7 +2227,7 @@ def main():
     {RS}
     """)
     
-    # Start accounts from files
+    # Start accounts from files (only once)
     Thread(target=run_accounts, daemon=True).start()
     Thread(target=run_group_accounts, daemon=True).start()
     
