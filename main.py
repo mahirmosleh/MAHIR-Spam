@@ -51,8 +51,6 @@ invite_uids = []    # inv_uid.txt - ACTIVE TARGETS
 auto_spam_active = False
 auto_spam_thread = None
 refresh_timer = None
-target_status_cache = {}
-target_group_leaders = {}
 active_invite_targets = {}
 invite_spam_thread = None
 smart_monitor_threads = {}
@@ -435,10 +433,9 @@ def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
     """Create join request with badge"""
     try:
         avatar_ids = [
-            902000028, 902000011, 902000015, 902000013, 902000086,
-            902000154, 902000127, 902000207, 902000246, 902000305,
-            902000338, 902047016, 902049015, 902052006, 902000100,
-            902000204, 902052006, 902037031, 902042011, 902053016, 902051013
+            902000011, 902000013, 902047016, 902049015,
+            902000154, 902000127, 902000207, 902000305,        
+            902037031, 902042011, 902053016, 902053018
         ]
         selected_avatar = random.choice(avatar_ids)
 
