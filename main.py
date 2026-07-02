@@ -1,12 +1,14 @@
 import os, sys, time, json, ssl, socket, threading, asyncio, base64, binascii, re, jwt, pickle, random
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
-from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, send_from_directory
+from functools import wraps
+import tempfile
+import shutil
 
 import requests
 import urllib3
-from functools import wraps
 from Pb2 import MajoRLoGinrEq_pb2
 import random
 from Crypto.Cipher import AES
@@ -29,6 +31,7 @@ SECRET_KEY = "mahir_system_secret_key_2024"
 # ==================== ফ্লাস্ক অ্যাপ ====================
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB max file size
 
 # ==================== LOGIN REQUIRED DECORATOR ====================
 def login_required(f):
@@ -42,20 +45,22 @@ def login_required(f):
 # ==================== গ্লোবাল ভেরিয়েবল ====================
 connected_clients = {}
 connected_clients_lock = threading.Lock()
-active_power_targets = {}
-active_power_lock = threading.Lock()
+active_spam_targets = {}  # target_uid -> {'type': 'full' or 'squad', 'start_time': datetime}
+active_spam_lock = threading.Lock()
 spam_threads = {}
 spam_threads_lock = threading.Lock()
-auto_uids = []      # auto_uid.txt - SMART MONITORED
-invite_uids = []    # inv_uid.txt - ACTIVE TARGETS
-auto_spam_active = False
-auto_spam_thread = None
-refresh_timer = None
-active_invite_targets = {}
-invite_spam_thread = None
-smart_monitor_threads = {}
-smart_monitor_lock = threading.Lock()
-smart_target_statuses = {}
+
+# File paths
+ACCOUNTS_FILE = "accs.txt"
+GROUP_ACCOUNTS_FILE = "group.txt"
+UPLOAD_FOLDER = "uploads"
+
+# Auto reset timer
+auto_reset_timer = None
+AUTO_RESET_INTERVAL = 2 * 60 * 60  # 2 hours in seconds
+
+# Create upload folder
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 C = "\033[96m"
 G = "\033[92m"
@@ -80,297 +85,86 @@ GROUP_CONFIGS = {
     6: {"type": 3, "players": 6}
 }
 
-# ==================== FILE LOADERS ====================
-def load_invite_uids(filename="inv_uid.txt"):
-    """Load UIDs from inv_uid.txt"""
-    global invite_uids
-    uids = []
+# ==================== DYNAMIC ACCOUNT LOADER ====================
+def load_accounts_from_text(content):
+    """Load accounts from text content"""
+    accounts = []
     try:
-        with open(filename, "r", encoding="utf-8") as file:
-            for line in file:
-                uid = line.strip()
-                if uid and not uid.startswith("#") and uid.isdigit():
-                    uids.append(uid)
-        invite_uids = uids
-        print(f"{G}📦 Loaded {len(invite_uids)} ACTIVE TARGETS from inv_uid.txt{RS}")
-    except FileNotFoundError:
-        print(f"{Y}⚠️ inv_uid.txt not found! Creating...{RS}")
-        with open(filename, "w") as f:
-            f.write("# ACTIVE TARGETS - These UIDs will be spammed directly\n")
-            f.write("# Example:\n")
-            f.write("# 1234567890\n")
-        invite_uids = []
-    return invite_uids
-
-def save_invite_uids(uids):
-    """Save UIDs to inv_uid.txt"""
-    try:
-        with open("inv_uid.txt", "w", encoding="utf-8") as file:
-            file.write("# ACTIVE TARGETS - These UIDs will be spammed directly\n")
-            file.write("# Example:\n")
-            for uid in uids:
-                file.write(f"{uid}\n")
-        global invite_uids
-        invite_uids = uids
-    except Exception as e:
-        print(f"{R}❌ Failed to save inv_uid.txt: {e}{RS}")
-
-def load_auto_uids(filename="auto_uid.txt"):
-    """Load UIDs from auto_uid.txt - SMART MONITORED"""
-    global auto_uids
-    uids = []
-    try:
-        with open(filename, "r", encoding="utf-8") as file:
-            for line in file:
-                uid = line.strip()
-                if uid and not uid.startswith("#") and uid.isdigit():
-                    uids.append(uid)
-        auto_uids = uids
-        print(f"{G}📦 Loaded {len(auto_uids)} SMART MONITOR targets from auto_uid.txt{RS}")
-    except FileNotFoundError:
-        print(f"{Y}⚠️ auto_uid.txt not found! Creating...{RS}")
-        with open(filename, "w") as f:
-            f.write("# SMART MONITORED - These UIDs will be monitored for status\n")
-            f.write("# Example:\n")
-            f.write("# 1234567890\n")
-        auto_uids = []
-    return auto_uids
-
-# ==================== SMART MONITOR FUNCTIONS ====================
-def create_status_check_packet(key, iv, target_uid):
-    """Create status check packet"""
-    try:
-        fields = {
-            1: 33,
-            2: {
-                1: int(target_uid),
-                2: "BD",
-                3: 1,
-                4: 1,
-                5: bytes([1, 7, 9, 10, 11, 18, 25, 26, 32]),
-                6: "[C][B][FF0000] STATUS CHECK",
-                7: 330,
-                8: 1000,
-                10: "BD",
-                11: bytes.fromhex("61" * 32),
-                12: 1,
-                13: int(target_uid),
-                16: 1,
-                17: 1,
-                18: 312,
-                19: 46,
-                23: bytes([16, 1, 24, 1]),
-                24: random.choice([902000028, 902000011, 902000015]),
-                26: "",
-                28: ""
-            },
-            10: "en",
-            13: {2: 1, 3: 1}
-        }
-        
-        packet = create_proto_sync(fields).hex()
-        packet_type = "0519"
-        encrypted = EnC_PacKeT(packet, key, iv)
-        length = len(encrypted) // 2
-        len_hex = DecodE_HeX(length)
-        padding = "000" if len(len_hex) == 5 else "0000"
-        
-        return bytes.fromhex(packet_type + padding + len_hex + encrypted)
-    except Exception as e:
-        return None
-
-def smart_monitor_worker(target_uid):
-    """Smart monitor worker for a single UID"""
-    global smart_target_statuses
-    
-    print(f"{G}🧠 Starting SMART monitor for {target_uid}{RS}")
-    
-    while True:
-        with smart_monitor_lock:
-            if target_uid not in smart_monitor_threads:
-                break
-        
-        with connected_clients_lock:
-            clients_list = list(connected_clients.values())
-        
-        if not clients_list:
-            time.sleep(5)
-            continue
-        
-        # Check status by sending packets
-        status = "CHECKING"
-        try:
-            for client in clients_list[:3]:  # Use first 3 bots
-                if hasattr(client, 'CliEnts2') and client.key:
-                    try:
-                        pkt = create_status_check_packet(client.key, client.iv, target_uid)
-                        if pkt:
-                            client.CliEnts2.send(pkt)
-                            status = "ONLINE"
-                            break
-                    except:
-                        pass
-                time.sleep(0.5)
-        except:
-            status = "ERROR"
-        
-        with smart_monitor_lock:
-            smart_target_statuses[target_uid] = status
-        
-        # If target is online, start spam
-        if status == "ONLINE":
-            print(f"{G}🎯 Target {target_uid} is ONLINE - Starting spam{RS}")
-            start_multi_spam([target_uid])
-        
-        time.sleep(30)  # Check every 30 seconds
-
-def start_smart_monitor(uid):
-    """Start smart monitor for a UID"""
-    with smart_monitor_lock:
-        if uid in smart_monitor_threads:
-            return False, "Already monitoring"
-        
-        thread = Thread(target=smart_monitor_worker, args=(uid,), daemon=True)
-        smart_monitor_threads[uid] = thread
-        thread.start()
-        return True, f"Started monitoring {uid}"
-
-def stop_smart_monitor(uid):
-    """Stop smart monitor for a UID"""
-    with smart_monitor_lock:
-        if uid in smart_monitor_threads:
-            del smart_monitor_threads[uid]
-            if uid in smart_target_statuses:
-                del smart_target_statuses[uid]
-            return True, f"Stopped monitoring {uid}"
-        return False, "Not monitoring"
-
-# ==================== INVITE TARGETS SPAM WORKER ====================
-def invite_targets_spam_worker():
-    """inv_uid.txt এর UID গুলোতে সরাসরি স্প্যাম"""
-    global auto_spam_active
-    
-    print(f"\n{G}{'='*60}{RS}")
-    print(f"{G}🎯 ACTIVE TARGETS SPAM STARTED ON {len(invite_uids)} TARGETS:{RS}")
-    for tid in invite_uids:
-        print(f"{G}   ➤ {tid} (ACTIVE TARGET){RS}")
-    print(f"{C}{'='*60}{RS}\n")
-
-    total_requests = 0
-    round_number = 0
-
-    def run_async(coro):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        except:
-            return None
-        finally:
-            loop.close()
-
-    while auto_spam_active:
-        with connected_clients_lock:
-            clients_list = list(connected_clients.values())
-
-        if not clients_list:
-            time.sleep(2)
-            continue
-
-        round_number += 1
-
-        for target_id in invite_uids:
-            if not auto_spam_active:
-                break
+        for line in content.split('\n'):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                if ":" in line:
+                    parts = line.split(":")
+                    uid = parts[0].strip()
+                    pwd = parts[1].strip() if len(parts) > 1 else ""
+                else:
+                    uid = line.strip()
+                    pwd = ""
                 
-            for client in clients_list:
-                try:
-                    if hasattr(client, 'CliEnts2') and client.key:
-                        # Room spam
-                        try:
-                            open_pkt = openroom(client.key, client.iv)
-                            if open_pkt:
-                                client.CliEnts2.send(open_pkt)
-                            
-                            spam_pkt = spmroom(client.key, client.iv, target_id)
-                            if spam_pkt:
-                                client.CliEnts2.send(spam_pkt)
-                                total_requests += 1
-                        except:
-                            pass
-
-                        # Group invites
-                        for players in [3, 5, 6]:
-                            try:
-                                async def send_invite():
-                                    p1 = await OpEnSq(client.key, client.iv, "BD")
-                                    client.CliEnts2.send(p1)
-                                    await asyncio.sleep(0.05)
-                                    p2 = await cHSq(players, target_id, client.key, client.iv, "BD")
-                                    client.CliEnts2.send(p2)
-                                    await asyncio.sleep(0.05)
-                                    p3 = await SEnd_InV(players, target_id, client.key, client.iv, "BD")
-                                    client.CliEnts2.send(p3)
-                                    total_requests += 1
-                                    await asyncio.sleep(0.05)
-                                    p4 = await ExiT(client.key, client.iv)
-                                    client.CliEnts2.send(p4)
-                                run_async(send_invite())
-                            except:
-                                pass
-
-                        # Badge join
-                        for badge_name, badge_value in BADGES.items():
-                            try:
-                                badge_pkt = create_badge_join_packet(client.key, client.iv, target_id, badge_value)
-                                if badge_pkt:
-                                    client.CliEnts2.send(badge_pkt)
-                                    total_requests += 1
-                                    time.sleep(0.03)
-                            except:
-                                pass
-
-                except Exception as e:
-                    print(f"{R}❌ Error: {e}{RS}")
-
-                time.sleep(0.05)
-
-        if round_number % 5 == 0:
-            print(f"{C}{'='*50}{RS}")
-            print(f"{G}📊 ACTIVE TARGETS Round {round_number} Complete{RS}")
-            print(f"{G}📊 Total Requests: {total_requests}{RS}")
-            print(f"{G}🎯 Active Targets: {len(invite_uids)}{RS}")
-            print(f"{G}🤖 Bots Online: {len(clients_list)}{RS}")
-            print(f"{C}{'='*50}{RS}\n")
+                if uid.isdigit():
+                    accounts.append({'id': uid, 'password': pwd})
         
-        time.sleep(0.5)
+        return accounts
+    except Exception as e:
+        print(f"{R}❌ Error loading accounts: {e}{RS}")
+        return []
 
-    print(f"\n{R}🛑 ACTIVE TARGETS SPAM STOPPED{RS}\n")
+def load_accounts(filename="accs.txt"):
+    """Load accounts from file"""
+    accounts = []
+    try:
+        if not os.path.exists(filename):
+            with open(filename, "w") as f:
+                f.write("# Format: UID:PASSWORD\n")
+                f.write("# Example:\n")
+                f.write("# 1234567890:password123\n")
+            return []
 
-def start_invite_targets_spam():
-    """inv_uid.txt এর UID গুলোতে স্প্যাম শুরু করুন"""
-    global auto_spam_active, invite_spam_thread
+        with open(filename, "r", encoding="utf-8") as file:
+            content = file.read()
+            accounts = load_accounts_from_text(content)
+        
+        print(f"{G}📦 Loaded {len(accounts)} accounts from {filename}{RS}")
+    except Exception as e:
+        print(f"{R}❌ Error loading {filename}: {e}{RS}")
     
-    if not invite_uids:
-        print(f"{Y}⚠️ No active targets in inv_uid.txt{RS}")
-        return False, "No active targets in inv_uid.txt"
-    
-    if invite_spam_thread and invite_spam_thread.is_alive():
-        return False, "Active targets spam already running"
-    
-    auto_spam_active = True
-    invite_spam_thread = Thread(target=invite_targets_spam_worker, daemon=True)
-    invite_spam_thread.start()
-    
-    return True, f"Started spam on {len(invite_uids)} active targets"
+    return accounts
 
-def stop_invite_targets_spam():
-    """inv_uid.txt এর স্প্যাম বন্ধ করুন"""
-    global auto_spam_active
-    auto_spam_active = False
-    return True, "Active targets spam stopped"
+def load_group_accounts(filename="group.txt"):
+    """Load group accounts for squad creation"""
+    accounts = []
+    try:
+        if not os.path.exists(filename):
+            with open(filename, "w") as f:
+                f.write("# Group accounts for squad creation\n")
+                f.write("# Format: UID:PASSWORD\n")
+            return []
 
-# ==================== CORE SPAM FUNCTIONS ====================
+        with open(filename, "r", encoding="utf-8") as file:
+            content = file.read()
+            accounts = load_accounts_from_text(content)
+        
+        print(f"{G}📦 Loaded {len(accounts)} group accounts from {filename}{RS}")
+    except Exception as e:
+        print(f"{R}❌ Error loading {filename}: {e}{RS}")
+    
+    return accounts
+
+# Global accounts (will be updated dynamically)
+ACCOUNTS = []
+GROUP_ACCOUNTS = []
+
+def update_accounts_from_files():
+    """Update accounts from files"""
+    global ACCOUNTS, GROUP_ACCOUNTS
+    ACCOUNTS = load_accounts(ACCOUNTS_FILE)
+    GROUP_ACCOUNTS = load_group_accounts(GROUP_ACCOUNTS_FILE)
+    return ACCOUNTS, GROUP_ACCOUNTS
+
+# Initial load
+update_accounts_from_files()
+
+# ==================== PACKET CREATION FUNCTIONS ====================
 def create_group_invite_packet(key, iv, target_uid, players=5, region="BD"):
     """Create group invite packet"""
     try:
@@ -427,6 +221,7 @@ def create_group_invite_packet(key, iv, target_uid, players=5, region="BD"):
         
         return bytes.fromhex(packet_type + padding + len_hex + encrypted)
     except Exception as e:
+        print(f"{R}❌ Group invite packet error: {e}{RS}")
         return None
 
 def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
@@ -496,6 +291,7 @@ def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
         
         return bytes.fromhex(packet_type + padding + len_hex + encrypted)
     except Exception as e:
+        print(f"{R}❌ Badge join packet error: {e}{RS}")
         return None
 
 def encode_varint_sync(value: int) -> bytes:
@@ -536,57 +332,46 @@ def create_proto_sync(fields):
             
     return bytes(packet)
 
-async def OpEnSq(K, V, region="BD"):
+async def OpEnSq(K, V, region):
     fields = {
-        1: 1, 
+        1: 1,
         2: {
-            2: "\u0001", 
-            3: 1, 
-            4: 1, 
-            5: "en", 
-            9: 1, 
-            11: 1, 
-            13: 1, 
+            2: "\u0001",
+            3: 1,
+            4: 1,
+            5: "en",
+            9: 1,
+            11: 1,
+            13: 1,
             14: {
-                1: 46,
-                2: 1393, 
-                6: 11, 
-                8: "1.120.2", 
-                9: 2, 
+                2: 5756,
+                6: 11,
+                8: "1.122.1",
+                9: 2,
                 10: 4
             }
         }
     }
-    if region.lower() == "ind":
-        packet = '0514'
-    elif region.lower() == "bd":
-        packet = "0519"
-    else:
-        packet = "0515"
+    packet = '0514' if region.lower() == "BD" else "0515"
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet, K, V)
 
-async def cHSq(Nu, Uid, K, V, region="BD"):
+async def cHSq(Nu, Uid, K, V, region):
     fields = {
-        1: 17, 
+        1: 17,
         2: {
-            1: int(Uid), 
-            2: 1, 
-            3: int(Nu - 1), 
-            4: 46,
-            5: "\x1a", 
-            8: 12,
-            13: 330
+            1: int(Uid),
+            2: 1,
+            3: int(Nu - 1),
+            4: 62,
+            5: "\u001a",
+            8: 5,
+            13: 329
         }
     }
-    if region.lower() == "ind":
-        packet = '0514'
-    elif region.lower() == "bd":
-        packet = "0519"
-    else:
-        packet = "0515"
+    packet = '0514' if region.lower() == "BD" else "0515"
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet, K, V)
 
-async def SEnd_InV(Nu, Uid, K, V, region="BD"):
+async def SEnd_InV(Nu, Uid, K, V, region):
     fields = {
         1: 2,
         2: {
@@ -595,228 +380,241 @@ async def SEnd_InV(Nu, Uid, K, V, region="BD"):
             4: int(Nu)
         }
     }
-    packet = '0514' if region.lower() == "bd" else "0515"
+    packet = '0514' if region.lower() == "BD" else "0515"
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet, K, V)
 
 async def ExiT(K, V):
     fields = {1: 7, 2: {1: 0}}
     return await _pk((await _pb(fields)).hex(), '0515', K, V)
 
-async def GeneRaTePk(data, pak, K, V):
-    encrypted = EnC_PacKeT(data, K, V)
-    length = len(encrypted) // 2
-    len_hex = DecodE_HeX(length)
-    padding_map = {2: "000000", 3: "00000", 4: "0000", 5: "000"}
-    padding = padding_map.get(len(len_hex), "000")
-    return bytes.fromhex(pak + padding + len_hex + encrypted)
+# ==================== SPAM WORKER FUNCTIONS ====================
+def run_async(coro):
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    except:
+        return None
+    finally:
+        loop.close()
 
-async def _pb(fields):
-    return create_proto_sync(fields)
+def send_full_spam(client, target_uid):
+    """Send full spam: room + squad + badge + group invites"""
+    total_sent = 0
+    
+    try:
+        if not hasattr(client, 'CliEnts2') or not client.key:
+            return 0
+        
+        # === 1. Room Spam ===
+        try:
+            open_pkt = openroom(client.key, client.iv)
+            if open_pkt:
+                client.CliEnts2.send(open_pkt)
+            
+            spam_pkt = spmroom(client.key, client.iv, target_uid)
+            if spam_pkt:
+                client.CliEnts2.send(spam_pkt)
+                total_sent += 1
+        except:
+            pass
 
-async def _pk(data, pak, K, V):
-    return await GeneRaTePk(data, pak, K, V)
+        # === 2. Squad Invite (5 player) ===
+        try:
+            async def send_squad():
+                p1 = await OpEnSq(client.key, client.iv, "BD")
+                client.CliEnts2.send(p1)
+                await asyncio.sleep(0.05)
+                p2 = await cHSq(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p2)
+                await asyncio.sleep(0.05)
+                p3 = await SEnd_InV(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p3)
+                await asyncio.sleep(0.05)
+                p4 = await ExiT(client.key, client.iv)
+                client.CliEnts2.send(p4)
+            run_async(send_squad())
+            total_sent += 1
+        except:
+            pass
 
-# ==================== SPAM WORKER ====================
-def spam_worker_multi(targets_list):
-    """একাধিক টার্গেটে স্প্যাম"""
+        # === 3. Badge Join ===
+        for badge_name, badge_value in BADGES.items():
+            try:
+                badge_pkt = create_badge_join_packet(client.key, client.iv, target_uid, badge_value)
+                if badge_pkt:
+                    client.CliEnts2.send(badge_pkt)
+                    total_sent += 1
+                    time.sleep(0.03)
+            except:
+                pass
+
+        # === 4. Group Invites (3, 5, 6 player) ===
+        for players in [3, 5, 6]:
+            try:
+                group_pkt = create_group_invite_packet(client.key, client.iv, target_uid, players)
+                if group_pkt:
+                    client.CliEnts2.send(group_pkt)
+                    total_sent += 1
+                    time.sleep(0.03)
+            except:
+                pass
+                
+    except Exception as e:
+        print(f"{R}❌ Full spam error: {e}{RS}")
+    
+    return total_sent
+
+def send_squad_spam(client, target_uid):
+    """Send only squad spam (group invites)"""
+    total_sent = 0
+    
+    try:
+        if not hasattr(client, 'CliEnts2') or not client.key:
+            return 0
+        
+        # === Squad Invite (5 player) ===
+        try:
+            async def send_squad():
+                p1 = await OpEnSq(client.key, client.iv, "BD")
+                client.CliEnts2.send(p1)
+                await asyncio.sleep(0.05)
+                p2 = await cHSq(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p2)
+                await asyncio.sleep(0.05)
+                p3 = await SEnd_InV(5, target_uid, client.key, client.iv, "BD")
+                client.CliEnts2.send(p3)
+                await asyncio.sleep(0.05)
+                p4 = await ExiT(client.key, client.iv)
+                client.CliEnts2.send(p4)
+            run_async(send_squad())
+            total_sent += 1
+        except:
+            pass
+
+        # === Group Invites (3, 6 player) ===
+        for players in [3, 6]:
+            try:
+                group_pkt = create_group_invite_packet(client.key, client.iv, target_uid, players)
+                if group_pkt:
+                    client.CliEnts2.send(group_pkt)
+                    total_sent += 1
+                    time.sleep(0.03)
+            except:
+                pass
+                
+    except Exception as e:
+        print(f"{R}❌ Squad spam error: {e}{RS}")
+    
+    return total_sent
+
+def spam_worker(target_uid, spam_type='full'):
+    """Main spam worker for a target"""
     print(f"\n{G}{'='*60}{RS}")
-    print(f"{G}🎯 MULTI-TARGET SPAM STARTED ON {len(targets_list)} TARGETS:{RS}")
-    for tid in targets_list:
-        print(f"{G}   ➤ {tid}{RS}")
+    print(f"{G}🎯 SPAM STARTED ON {target_uid} (Type: {spam_type}){RS}")
     print(f"{C}{'='*60}{RS}\n")
 
     total_requests = 0
     round_number = 0
 
-    def run_async(coro):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        except:
-            return None
-        finally:
-            loop.close()
-
     while True:
-        global auto_spam_active
-        if not auto_spam_active:
-            break
-
-        with active_power_lock:
-            current_targets = list(active_power_targets.keys())
-            if not current_targets:
+        with active_spam_lock:
+            if target_uid not in active_spam_targets:
                 break
 
         with connected_clients_lock:
             clients_list = list(connected_clients.values())
+            
+        # Also use group accounts for squad spam
+        group_clients = []
+        for acc in GROUP_ACCOUNTS:
+            if acc['id'] in connected_clients:
+                group_clients.append(connected_clients[acc['id']])
+        
+        all_clients = clients_list + group_clients
 
-        if not clients_list:
+        if not all_clients:
             time.sleep(2)
             continue
 
         round_number += 1
 
-        for target_id in current_targets:
-            for client in clients_list:
-                with active_power_lock:
-                    if target_id not in active_power_targets:
-                        break
+        for client in all_clients:
+            with active_spam_lock:
+                if target_uid not in active_spam_targets:
+                    break
 
-                try:
-                    if hasattr(client, 'CliEnts2') and client.key:
-                        # Room spam
-                        try:
-                            open_pkt = openroom(client.key, client.iv)
-                            if open_pkt:
-                                client.CliEnts2.send(open_pkt)
-                            
-                            spam_pkt = spmroom(client.key, client.iv, target_id)
-                            if spam_pkt:
-                                client.CliEnts2.send(spam_pkt)
-                                total_requests += 1
-                        except:
-                            pass
+            try:
+                if spam_type == 'full':
+                    total_requests += send_full_spam(client, target_uid)
+                else:
+                    total_requests += send_squad_spam(client, target_uid)
+            except Exception as e:
+                print(f"{R}❌ Spam error: {e}{RS}")
 
-                        # Group invites
-                        try:
-                            async def send_invite_5():
-                                p1 = await OpEnSq(client.key, client.iv, "BD")
-                                client.CliEnts2.send(p1)
-                                await asyncio.sleep(0.05)
-                                p2 = await cHSq(5, target_id, client.key, client.iv, "BD")
-                                client.CliEnts2.send(p2)
-                                await asyncio.sleep(0.05)
-                                p3 = await SEnd_InV(5, target_id, client.key, client.iv, "BD")
-                                client.CliEnts2.send(p3)
-                                total_requests += 1
-                                await asyncio.sleep(0.05)
-                                p4 = await ExiT(client.key, client.iv)
-                                client.CliEnts2.send(p4)
-                            run_async(send_invite_5())
-                        except:
-                            pass
+            time.sleep(0.05)
 
-                        # Badge join
-                        for badge_name, badge_value in BADGES.items():
-                            try:
-                                badge_pkt = create_badge_join_packet(client.key, client.iv, target_id, badge_value)
-                                if badge_pkt:
-                                    client.CliEnts2.send(badge_pkt)
-                                    total_requests += 1
-                                    time.sleep(0.03)
-                            except:
-                                pass
-
-                        # 3 player group
-                        try:
-                            group_pkt_3 = create_group_invite_packet(client.key, client.iv, target_id, 3)
-                            if group_pkt_3:
-                                client.CliEnts2.send(group_pkt_3)
-                                total_requests += 1
-                                time.sleep(0.03)
-                        except:
-                            pass
-
-                        # 6 player group
-                        try:
-                            group_pkt_6 = create_group_invite_packet(client.key, client.iv, target_id, 6)
-                            if group_pkt_6:
-                                client.CliEnts2.send(group_pkt_6)
-                                total_requests += 1
-                                time.sleep(0.03)
-                        except:
-                            pass
-
-                except Exception as e:
-                    print(f"{R}❌ Error: {e}{RS}")
-
-                time.sleep(0.05)
-
-        if round_number % 5 == 0:
+        if round_number % 10 == 0:
             print(f"{C}{'='*50}{RS}")
             print(f"{G}📊 Round {round_number} Complete{RS}")
             print(f"{G}📊 Total Requests: {total_requests}{RS}")
-            print(f"{G}🎯 Active Targets: {len(current_targets)}{RS}")
-            print(f"{G}🤖 Bots Online: {len(clients_list)}{RS}")
+            print(f"{G}🎯 Target: {target_uid}{RS}")
+            print(f"{G}🤖 Bots: {len(all_clients)}{RS}")
             print(f"{C}{'='*50}{RS}\n")
         
         time.sleep(0.5)
 
     with spam_threads_lock:
-        for tid in targets_list:
-            if tid in spam_threads:
-                del spam_threads[tid]
+        if target_uid in spam_threads:
+            del spam_threads[target_uid]
 
-    print(f"\n{R}🛑 MULTI-SPAM STOPPED ON {len(targets_list)} TARGETS{RS}\n")
+    print(f"\n{R}🛑 SPAM STOPPED ON {target_uid}{RS}\n")
 
-def start_multi_spam(targets_list):
-    """একাধিক টার্গেটে স্প্যাম শুরু করুন"""
-    global auto_spam_active
+def start_spam(target_uid, spam_type='full'):
+    """Start spam on a target"""
+    with active_spam_lock:
+        if target_uid in active_spam_targets:
+            return False, f"Already spamming {target_uid}"
+        
+        active_spam_targets[target_uid] = {
+            'type': spam_type,
+            'start_time': datetime.now()
+        }
     
-    if isinstance(targets_list, str):
-        targets_list = [targets_list]
+    thread = Thread(target=spam_worker, args=(target_uid, spam_type), daemon=True)
+    with spam_threads_lock:
+        spam_threads[target_uid] = thread
+    thread.start()
     
-    new_targets = []
-    with active_power_lock:
-        for target in targets_list:
-            if target not in active_power_targets:
-                active_power_targets[target] = {
-                    'active': True,
-                    'start_time': datetime.now()
-                }
-                new_targets.append(target)
-    
-    if new_targets:
-        auto_spam_active = True
-        thread = Thread(target=spam_worker_multi, args=(new_targets,), daemon=True)
-        with spam_threads_lock:
-            for tid in new_targets:
-                spam_threads[tid] = thread
-        thread.start()
-        return True, f"Started spam on {len(new_targets)} targets"
-    return False, "No new targets to start"
+    return True, f"Started {spam_type} spam on {target_uid}"
 
-def stop_spam(target_id):
-    """একটি নির্দিষ্ট টার্গেটের স্প্যাম বন্ধ করুন"""
-    with active_power_lock:
-        if target_id in active_power_targets:
-            del active_power_targets[target_id]
-            return True, f"Spam stopped on: {target_id}"
-        return False, f"No active spam on: {target_id}"
+def stop_spam(target_uid):
+    """Stop spam on a target"""
+    with active_spam_lock:
+        if target_uid in active_spam_targets:
+            del active_spam_targets[target_uid]
+            return True, f"Stopped spam on {target_uid}"
+    return False, f"No spam found for {target_uid}"
 
 def stop_all_spam():
-    """সব স্প্যাম বন্ধ করুন"""
-    global auto_spam_active
-    auto_spam_active = False
-    with active_power_lock:
-        targets = list(active_power_targets.keys())
+    """Stop all spam"""
+    with active_spam_lock:
+        targets = list(active_spam_targets.keys())
         for target in targets:
-            del active_power_targets[target]
+            del active_spam_targets[target]
     return True, f"Stopped all spam ({len(targets)} targets)"
-
-def start_spam(uid, spam_type='full'):
-    """Start spam on a single target"""
-    if spam_type == 'squad':
-        # Squad spam only
-        return start_multi_spam([uid])
-    else:
-        # Full spam
-        return start_multi_spam([uid])
 
 def get_spam_status():
     """Get current spam status"""
-    with active_power_lock:
-        active_targets = list(active_power_targets.keys())
-        targets_info = []
-        for target in active_targets:
-            info = active_power_targets[target]
+    with active_spam_lock:
+        active_targets = []
+        for target, info in active_spam_targets.items():
             start_time = info.get('start_time')
             elapsed = (datetime.now() - start_time).total_seconds() if start_time else 0
-            targets_info.append({
+            active_targets.append({
                 'uid': target,
-                'elapsed_minutes': int(elapsed / 60),
-                'type': 'full'
+                'type': info.get('type', 'full'),
+                'elapsed_minutes': int(elapsed / 60)
             })
     
     with connected_clients_lock:
@@ -824,122 +622,51 @@ def get_spam_status():
         accounts_list = list(connected_clients.keys())
     
     return {
-        'active_targets': targets_info,
+        'active_targets': active_targets,
         'active_count': len(active_targets),
         'accounts_count': accounts_count,
-        'accounts_list': accounts_list[:50],
-        'invite_uids': invite_uids,
-        'auto_active': auto_spam_active
+        'accounts_list': accounts_list[:50]
     }
 
-def trigger_manual_reset():
-    """Manually trigger auto reset"""
-    global refresh_timer
-    print(f"{Y}🔄 Manual reset triggered{RS}")
-    stop_all_spam()
-    stop_invite_targets_spam()
-    
-    # Reload files
-    load_invite_uids()
-    load_auto_uids()
-    
-    # Restart spam
-    if invite_uids:
-        start_invite_targets_spam()
-    
-    # Restart monitor
-    for uid in auto_uids:
-        start_smart_monitor(uid)
-    
-    # Reset timer
-    if refresh_timer:
-        refresh_timer.cancel()
-    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
-    refresh_timer.daemon = True
-    refresh_timer.start()
-    
-    return True, "Manual reset completed"
-
-# ==================== AUTO REFRESH ====================
-def auto_refresh_and_restart():
-    """প্রতি ৭ মিনিটে রিফ্রেশ"""
-    global auto_spam_active, refresh_timer
+# ==================== AUTO RESET ====================
+def auto_reset_spam():
+    """Auto reset all spam every 2 hours"""
+    global auto_reset_timer
     
     print(f"\n{Y}{'='*50}{RS}")
-    print(f"{Y}🔄 AUTO REFRESH INITIATED{RS}")
+    print(f"{Y}🔄 AUTO RESET INITIATED (Every 2 Hours){RS}")
     print(f"{Y}{'='*50}{RS}\n")
     
-    # Reload files
-    load_invite_uids()
-    load_auto_uids()
+    # Stop all spam
+    stop_all_spam()
     
-    # Restart spam if not running
-    if invite_uids:
-        if not invite_spam_thread or not invite_spam_thread.is_alive():
-            print(f"{G}🎯 Starting ACTIVE TARGETS worker...{RS}")
-            start_invite_targets_spam()
-        else:
-            print(f"{G}✅ ACTIVE TARGETS worker is already running.{RS}")
+    # Reload accounts from files
+    global ACCOUNTS, GROUP_ACCOUNTS
+    ACCOUNTS = load_accounts(ACCOUNTS_FILE)
+    GROUP_ACCOUNTS = load_group_accounts(GROUP_ACCOUNTS_FILE)
     
-    # Start smart monitors
-    for uid in auto_uids:
-        with smart_monitor_lock:
-            if uid not in smart_monitor_threads:
-                start_smart_monitor(uid)
+    print(f"{G}✅ Auto reset complete. Accounts reloaded.{RS}\n")
     
-    # Reset timer
-    if refresh_timer:
-        refresh_timer.cancel()
-    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
-    refresh_timer.daemon = True
-    refresh_timer.start()
-    
-    print(f"{G}✅ Refresh Complete. Next check in 7 minutes.{RS}\n")
+    # Schedule next reset
+    if auto_reset_timer:
+        auto_reset_timer.cancel()
+    auto_reset_timer = threading.Timer(AUTO_RESET_INTERVAL, auto_reset_spam)
+    auto_reset_timer.daemon = True
+    auto_reset_timer.start()
 
-def start_auto_refresh():
-    global refresh_timer
-    if refresh_timer:
-        refresh_timer.cancel()
-    refresh_timer = threading.Timer(7 * 60, auto_refresh_and_restart)
-    refresh_timer.daemon = True
-    refresh_timer.start()
-    print(f"{G}⏰ Auto-refresh timer started (every 7 minutes){RS}")
+def start_auto_reset():
+    global auto_reset_timer
+    if auto_reset_timer:
+        auto_reset_timer.cancel()
+    auto_reset_timer = threading.Timer(AUTO_RESET_INTERVAL, auto_reset_spam)
+    auto_reset_timer.daemon = True
+    auto_reset_timer.start()
+    print(f"{G}⏰ Auto-reset timer started (every {AUTO_RESET_INTERVAL//3600} hours){RS}")
 
-# ==================== ACCOUNTS ====================
-ACCOUNTS = []
-
-def load_accounts_from_file(filename="accs.txt"):
-    loaded_accounts = []
-    try:
-        if not os.path.exists(filename):
-            with open(filename, "w") as f:
-                f.write(f"# Format: UID:PASSWORD\n")
-                f.write(f"# Example:\n")
-                f.write(f"# 5435051601:your_password_here\n")
-            return []
-
-        with open(filename, "r", encoding="utf-8") as file:
-            for line in file:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    if ":" in line:
-                        parts = line.split(":")
-                        uid = parts[0].strip()
-                        pwd = parts[1].strip() if len(parts) > 1 else ""
-                    else:
-                        uid = line.strip()
-                        pwd = ""
-                    
-                    if uid.isdigit():
-                        loaded_accounts.append({'id': uid, 'password': pwd})
-        
-        print(f"{G}📦 Loaded {len(loaded_accounts)} accounts from {filename}{RS}")
-    except Exception as e:
-        print(f"{R}❌ Error loading {filename}: {e}{RS}")
-    
-    return loaded_accounts
-
-ACCOUNTS = load_accounts_from_file("accs.txt")
+def trigger_manual_reset():
+    """Manually trigger auto reset via API"""
+    auto_reset_spam()
+    return True, "Manual reset triggered"
 
 # ==================== FF CLIENT ====================
 class FF_CLient():
@@ -948,8 +675,6 @@ class FF_CLient():
         self.password = password
         self.key = None
         self.iv = None
-        self.max_retries = 3
-        self.retry_count = 0
         self.Get_FiNal_ToKen_0115()
 
     def Connect_SerVer_OnLine(self, Token, tok, host, port, key, iv, host2, port2):
@@ -1010,25 +735,17 @@ class FF_CLient():
                 self.Connect_SerVer(Token, tok, host, port, key, iv, host2, port2)
                                     
     def GeT_Key_Iv(self, serialized_data):
-        try:
-            my_message = xKEys.MyMessage()
-            my_message.ParseFromString(serialized_data)
-            timestamp, key, iv = my_message.field21, my_message.field22, my_message.field23
-            timestamp_obj = Timestamp()
-            timestamp_obj.FromNanoseconds(timestamp)
-            timestamp_seconds = timestamp_obj.seconds
-            timestamp_nanos = timestamp_obj.nanos
-            combined_timestamp = timestamp_seconds * 1_000_000_000 + timestamp_nanos
-            return combined_timestamp, key, iv
-        except Exception as e:
-            print(f"{R}❌ Key/IV extraction error: {e}{RS}")
-            return None, None, None
+        my_message = xKEys.MyMessage()
+        my_message.ParseFromString(serialized_data)
+        timestamp, key, iv = my_message.field21, my_message.field22, my_message.field23
+        timestamp_obj = Timestamp()
+        timestamp_obj.FromNanoseconds(timestamp)
+        timestamp_seconds = timestamp_obj.seconds
+        timestamp_nanos = timestamp_obj.nanos
+        combined_timestamp = timestamp_seconds * 1_000_000_000 + timestamp_nanos
+        return combined_timestamp, key, iv    
 
     def Guest_GeneRaTe(self, uid, password):
-        if not password:
-            print(f"{Y}⚠️ No password for {uid}, skipping...{RS}")
-            return None
-            
         self.url = "https://100067.connect.garena.com/oauth/guest/token/grant"
         self.headers = {
             "Host": "100067.connect.garena.com",
@@ -1046,29 +763,15 @@ class FF_CLient():
             "client_id": "100067",
         }
         try:
-            response = requests.post(self.url, headers=self.headers, data=self.dataa)
-            if response.status_code != 200:
-                print(f"{R}❌ Login failed {self.id}: HTTP {response.status_code}{RS}")
-                return None
-                
-            self.response = response.json()
-            
-            # Check if response has required keys
-            if 'access_token' not in self.response:
-                print(f"{R}❌ Login error {self.id}: {self.response.get('error', 'Unknown error')}{RS}")
-                return None
-                
-            self.Access_ToKen = self.response['access_token']
-            self.Access_Uid = self.response.get('open_id', uid)
+            self.response = requests.post(self.url, headers=self.headers, data=self.dataa).json()
+            self.Access_ToKen, self.Access_Uid = self.response['access_token'], self.response['open_id']
             time.sleep(0.2)
-            print(f'{C}🔐 Login success: {self.id}{RS}')
+            print(f'{C}🔐 Login: {self.id}{RS}')
             return self.ToKen_GeneRaTe(self.Access_ToKen, self.Access_Uid)
-        except requests.exceptions.RequestException as e:
-            print(f"{R}❌ Network error {self.id}: {e}{RS}")
-            return None
         except Exception as e: 
             print(f"{R}❌ Login error {self.id}: {e}{RS}")
-            return None
+            time.sleep(10)
+            return self.Guest_GeneRaTe(uid, password)
                                         
     def GeT_LoGin_PorTs(self, JwT_ToKen, PayLoad, dynamic_url="https://clientbp.ggpolarbear.com"):
         self.UrL = f'{dynamic_url}/GetLoginData'
@@ -1084,11 +787,7 @@ class FF_CLient():
             'Accept-Encoding': 'deflate, gzip',
         }        
         try:
-            self.Res = requests.post(self.UrL, headers=self.HeadErs, data=PayLoad, verify=False, timeout=10)
-            if self.Res.status_code != 200:
-                print(f"{R}❌ Failed to get ports: HTTP {self.Res.status_code}{RS}")
-                return None, None, None, None
-                
+            self.Res = requests.post(self.UrL, headers=self.HeadErs, data=PayLoad, verify=False)
             self.BesTo_data = json.loads(DeCode_PackEt(self.Res.content.hex()))  
             address, address2 = self.BesTo_data['32']['data'], self.BesTo_data['14']['data'] 
             ip, ip2 = address[:len(address) - 6], address2[:len(address2) - 6]
@@ -1133,7 +832,7 @@ class FF_CLient():
             major_login.gpu_renderer = "Adreno (TM) 650"
             major_login.gpu_version = "OpenGL ES 3.2 V@1.50"
             major_login.graphics_api = "OpenGLES3"
-            major_login.unique_device_id = f"Google|{random.randint(10000000, 99999999)}-{random.randint(1000, 9999)}"
+            major_login.unique_device_id = "Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57"
             major_login.language = "en"
             major_login.open_id = Access_Uid
             major_login.open_id_type = "4"
@@ -1176,106 +875,80 @@ class FF_CLient():
             self.PaYload = cipher.encrypt(pad(raw_data, 16))
 
         except Exception as e:
-            print(f"{R}❌ Protobuf building error {self.id}: {e}{RS}")
-            return None
+            print(f"{R}❌ Protobuf building error: {e}{RS}")
+            time.sleep(5)
+            return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
 
-        try:
-            self.ResPonse = requests.post(self.UrL, headers=self.HeadErs, data=self.PaYload, verify=False, timeout=15)
-            
-            if self.ResPonse.status_code == 200:
-                try:
-                    self.BesTo_data = json.loads(DeCode_PackEt(self.ResPonse.content.hex()))
-                    if '8' not in self.BesTo_data or 'data' not in self.BesTo_data['8']:
-                        print(f"{R}❌ Invalid response format {self.id}{RS}")
-                        return None
-                        
-                    self.JwT_ToKen = self.BesTo_data['8']['data']           
-                    combined_timestamp, key, iv = self.GeT_Key_Iv(self.ResPonse.content)
-                    if not all([key, iv]):
-                        print(f"{R}❌ Failed to extract key/iv {self.id}{RS}")
-                        return None
-                        
-                    ip, port, ip2, port2 = self.GeT_LoGin_PorTs(self.JwT_ToKen, self.PaYload)
-                    if not all([ip, port, ip2, port2]):
-                        print(f"{R}❌ Failed to get ports {self.id}{RS}")
-                        return None
-                        
-                    return self.JwT_ToKen, key, iv, combined_timestamp, ip, port, ip2, port2
-                except Exception as e:
-                    print(f"{R}❌ Response parsing error {self.id}: {e}{RS}")
-                    return None
-            else:
-                print(f"{R}❌ Token generation error {self.id}, status: {self.ResPonse.status_code}{RS}")
-                return None
-        except Exception as e:
-            print(f"{R}❌ Request error {self.id}: {e}{RS}")
-            return None
+        self.ResPonse = requests.post(self.UrL, headers=self.HeadErs, data=self.PaYload, verify=False)        
+        
+        if self.ResPonse.status_code == 200:
+            try:
+                self.BesTo_data = json.loads(DeCode_PackEt(self.ResPonse.content.hex()))
+                self.JwT_ToKen = self.BesTo_data['8']['data']           
+                self.combined_timestamp, self.key, self.iv = self.GeT_Key_Iv(self.ResPonse.content)
+                ip, port, ip2, port2 = self.GeT_LoGin_PorTs(self.JwT_ToKen, self.PaYload)            
+                return self.JwT_ToKen, self.key, self.iv, self.combined_timestamp, ip, port, ip2, port2
+            except Exception as e:
+                print(f"{R}❌ Response parsing error: {e}{RS}")
+                time.sleep(5)
+                return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
+        else:
+            print(f"{R}❌ Token generation error, status: {self.ResPonse.status_code}{RS}")
+            time.sleep(5)
+            return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
       
     def Get_FiNal_ToKen_0115(self):
-        while self.retry_count < self.max_retries:
+        try:
+            result = self.Guest_GeneRaTe(self.id, self.password)
+            if not result:
+                print(f"{Y}⚠️ Failed to get token {self.id}, retrying...{RS}")
+                time.sleep(5)
+                return self.Get_FiNal_ToKen_0115()
+                
+            token, key, iv, Timestamp, ip, port, ip2, port2 = result
+            
+            if not all([ip, port, ip2, port2]):
+                print(f"{Y}⚠️ Failed to get ports {self.id}, retrying...{RS}")
+                time.sleep(5)
+                return self.Get_FiNal_ToKen_0115()
+                
+            self.JwT_ToKen = token        
             try:
-                result = self.Guest_GeneRaTe(self.id, self.password)
-                if not result:
-                    self.retry_count += 1
-                    wait_time = self.retry_count * 5
-                    print(f"{Y}⚠️ Retry {self.retry_count}/{self.max_retries} for {self.id} in {wait_time}s{RS}")
-                    time.sleep(wait_time)
-                    continue
-                    
-                token, key, iv, Timestamp, ip, port, ip2, port2 = result
-                
-                if not all([ip, port, ip2, port2]):
-                    self.retry_count += 1
-                    time.sleep(self.retry_count * 3)
-                    continue
-                    
-                self.JwT_ToKen = token        
-                try:
-                    self.AfTer_DeC_JwT = jwt.decode(token, options={"verify_signature": False})
-                    self.AccounT_Uid = self.AfTer_DeC_JwT.get('account_id')
-                    if not self.AccounT_Uid:
-                        self.AccounT_Uid = self.id
-                    self.EncoDed_AccounT = hex(self.AccounT_Uid)[2:]
-                    self.HeX_VaLue = DecodE_HeX(Timestamp)
-                    self.TimE_HEx = self.HeX_VaLue
-                    self.JwT_ToKen_ = token.encode().hex()
-                    print(f'{C}🆔 Account UID: {self.AccounT_Uid}{RS}')
-                except Exception as e:
-                    print(f"{R}❌ Token decode error {self.id}: {e}{RS}")
-                    self.retry_count += 1
-                    time.sleep(self.retry_count * 3)
-                    continue
-                    
-                try:
-                    self.Header = hex(len(EnC_PacKeT(self.JwT_ToKen_, key, iv)) // 2)[2:]
-                    length = len(self.EncoDed_AccounT)
-                    self.__ = '00000000'
-                    if length == 9: self.__ = '0000000'
-                    elif length == 8: self.__ = '00000000'
-                    elif length == 10: self.__ = '000000'
-                    elif length == 7: self.__ = '000000000'
-                    self.Header = f'0115{self.__}{self.EncoDed_AccounT}{self.TimE_HEx}00000{self.Header}'
-                    self.FiNal_ToKen_0115 = self.Header + EnC_PacKeT(self.JwT_ToKen_, key, iv)
-                except Exception as e:
-                    print(f"{R}❌ Final token error {self.id}: {e}{RS}")
-                    self.retry_count += 1
-                    time.sleep(self.retry_count * 3)
-                    continue
-                    
-                self.AutH_ToKen = self.FiNal_ToKen_0115
-                self.Connect_SerVer(self.JwT_ToKen, self.AutH_ToKen, ip, port, key, iv, ip2, port2)
-                self.retry_count = 0
-                return self.AutH_ToKen, key, iv
-                
+                self.AfTer_DeC_JwT = jwt.decode(token, options={"verify_signature": False})
+                self.AccounT_Uid = self.AfTer_DeC_JwT.get('account_id')
+                self.EncoDed_AccounT = hex(self.AccounT_Uid)[2:]
+                self.HeX_VaLue = DecodE_HeX(Timestamp)
+                self.TimE_HEx = self.HeX_VaLue
+                self.JwT_ToKen_ = token.encode().hex()
+                print(f'{C}🆔 Account UID: {self.AccounT_Uid}{RS}')
             except Exception as e:
-                print(f"{R}❌ {self.id} connection failed: {e}{RS}")
-                self.retry_count += 1
-                time.sleep(self.retry_count * 5)
+                print(f"{R}❌ Token decode error {self.id}: {e}{RS}")
+                time.sleep(5)
+                return self.Get_FiNal_ToKen_0115()
                 
-        print(f"{R}❌ {self.id} failed after {self.max_retries} retries{RS}")
-        return None, None, None
-
-
+            try:
+                self.Header = hex(len(EnC_PacKeT(self.JwT_ToKen_, key, iv)) // 2)[2:]
+                length = len(self.EncoDed_AccounT)
+                self.__ = '00000000'
+                if length == 9: self.__ = '0000000'
+                elif length == 8: self.__ = '00000000'
+                elif length == 10: self.__ = '000000'
+                elif length == 7: self.__ = '000000000'
+                self.Header = f'0115{self.__}{self.EncoDed_AccounT}{self.TimE_HEx}00000{self.Header}'
+                self.FiNal_ToKen_0115 = self.Header + EnC_PacKeT(self.JwT_ToKen_, key, iv)
+            except Exception as e:
+                print(f"{R}❌ Final token error {self.id}: {e}{RS}")
+                time.sleep(5)
+                return self.Get_FiNal_ToKen_0115()
+                
+            self.AutH_ToKen = self.FiNal_ToKen_0115
+            self.Connect_SerVer(self.JwT_ToKen, self.AutH_ToKen, ip, port, key, iv, ip2, port2)        
+            return self.AutH_ToKen, key, iv
+            
+        except Exception as e:
+            print(f"{R}❌ {self.id} connection failed: {e}{RS}")
+            time.sleep(5)
+            return self.Get_FiNal_ToKen_0115()
 
 def start_account(account):
     try:
@@ -1285,10 +958,19 @@ def start_account(account):
         time.sleep(1)
         start_account(account)
 
-def run_accounts():
-    for acc in ACCOUNTS:
+def run_accounts_from_list(accounts):
+    """Run accounts from a list"""
+    for acc in accounts:
         Thread(target=start_account, args=(acc,), daemon=True).start()
         time.sleep(0.2)
+
+def run_accounts():
+    """Run accounts from ACCOUNTS list"""
+    run_accounts_from_list(ACCOUNTS)
+
+def run_group_accounts():
+    """Run group accounts from GROUP_ACCOUNTS list"""
+    run_accounts_from_list(GROUP_ACCOUNTS)
 
 # ==================== FLASK ROUTES ====================
 @app.route('/login', methods=['GET', 'POST'])
@@ -1311,17 +993,202 @@ def logout():
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-# ==================== API ROUTES ====================
+# ==================== FILE UPLOAD ROUTES ====================
 
-@app.route('/api/spam/all', methods=['GET', 'POST'])
-def api_spam_all():
-    password = request.args.get('pass') if request.method == 'GET' else None
-    if request.method == 'POST':
-        data = request.get_json() or {}
-        uid = data.get('uid', '')
-        password = data.get('pass')
+@app.route('/api/upload/accs', methods=['POST'])
+@login_required
+def upload_accs_file():
+    """Upload accs.txt file"""
+    global ACCOUNTS
+    
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'message': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'success': False, 'message': 'No file selected'}), 400
+    
+    try:
+        content = file.read().decode('utf-8')
+        accounts = load_accounts_from_text(content)
+        
+        if not accounts:
+            return jsonify({'success': False, 'message': 'No valid accounts found in file'}), 400
+        
+        # Save to file
+        with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+            f.write("# Uploaded via web\n")
+            for acc in accounts:
+                if acc['password']:
+                    f.write(f"{acc['id']}:{acc['password']}\n")
+                else:
+                    f.write(f"{acc['id']}\n")
+        
+        # Update global ACCOUNTS
+        ACCOUNTS = accounts
+        
+        # Reconnect accounts
+        Thread(target=run_accounts, daemon=True).start()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Uploaded {len(accounts)} accounts successfully',
+            'count': len(accounts)
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+@app.route('/api/upload/group', methods=['POST'])
+@login_required
+def upload_group_file():
+    """Upload group.txt file"""
+    global GROUP_ACCOUNTS
+    
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'message': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'success': False, 'message': 'No file selected'}), 400
+    
+    try:
+        content = file.read().decode('utf-8')
+        accounts = load_accounts_from_text(content)
+        
+        if not accounts:
+            return jsonify({'success': False, 'message': 'No valid accounts found in file'}), 400
+        
+        # Save to file
+        with open(GROUP_ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+            f.write("# Uploaded via web\n")
+            for acc in accounts:
+                if acc['password']:
+                    f.write(f"{acc['id']}:{acc['password']}\n")
+                else:
+                    f.write(f"{acc['id']}\n")
+        
+        # Update global GROUP_ACCOUNTS
+        GROUP_ACCOUNTS = accounts
+        
+        # Reconnect group accounts
+        Thread(target=run_group_accounts, daemon=True).start()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Uploaded {len(accounts)} group accounts successfully',
+            'count': len(accounts)
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+@app.route('/api/upload/both', methods=['POST'])
+@login_required
+def upload_both_files():
+    """Upload both accs.txt and group.txt files"""
+    global ACCOUNTS, GROUP_ACCOUNTS
+    
+    accs_file = request.files.get('accs_file')
+    group_file = request.files.get('group_file')
+    
+    results = {}
+    
+    # Process accs.txt
+    if accs_file and accs_file.filename != '':
+        try:
+            content = accs_file.read().decode('utf-8')
+            accounts = load_accounts_from_text(content)
+            if accounts:
+                with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+                    f.write("# Uploaded via web\n")
+                    for acc in accounts:
+                        if acc['password']:
+                            f.write(f"{acc['id']}:{acc['password']}\n")
+                        else:
+                            f.write(f"{acc['id']}\n")
+                ACCOUNTS = accounts
+                results['accs'] = {'success': True, 'count': len(accounts)}
+            else:
+                results['accs'] = {'success': False, 'message': 'No valid accounts found'}
+        except Exception as e:
+            results['accs'] = {'success': False, 'message': str(e)}
     else:
-        uid = request.args.get('uid', '')
+        results['accs'] = {'success': False, 'message': 'No file uploaded'}
+    
+    # Process group.txt
+    if group_file and group_file.filename != '':
+        try:
+            content = group_file.read().decode('utf-8')
+            accounts = load_accounts_from_text(content)
+            if accounts:
+                with open(GROUP_ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+                    f.write("# Uploaded via web\n")
+                    for acc in accounts:
+                        if acc['password']:
+                            f.write(f"{acc['id']}:{acc['password']}\n")
+                        else:
+                            f.write(f"{acc['id']}\n")
+                GROUP_ACCOUNTS = accounts
+                results['group'] = {'success': True, 'count': len(accounts)}
+            else:
+                results['group'] = {'success': False, 'message': 'No valid accounts found'}
+        except Exception as e:
+            results['group'] = {'success': False, 'message': str(e)}
+    else:
+        results['group'] = {'success': False, 'message': 'No file uploaded'}
+    
+    # Start accounts if any uploaded
+    if ACCOUNTS:
+        Thread(target=run_accounts, daemon=True).start()
+    if GROUP_ACCOUNTS:
+        Thread(target=run_group_accounts, daemon=True).start()
+    
+    return jsonify({'success': True, 'results': results})
+
+@app.route('/api/get/accs', methods=['GET'])
+@login_required
+def get_accs_file():
+    """Download accs.txt file"""
+    try:
+        return send_from_directory('.', ACCOUNTS_FILE, as_attachment=True)
+    except:
+        return jsonify({'success': False, 'message': 'File not found'}), 404
+
+@app.route('/api/get/group', methods=['GET'])
+@login_required
+def get_group_file():
+    """Download group.txt file"""
+    try:
+        return send_from_directory('.', GROUP_ACCOUNTS_FILE, as_attachment=True)
+    except:
+        return jsonify({'success': False, 'message': 'File not found'}), 404
+
+@app.route('/api/accounts/count', methods=['GET'])
+@login_required
+def get_accounts_count():
+    """Get current account counts"""
+    with connected_clients_lock:
+        connected_count = len(connected_clients)
+    
+    return jsonify({
+        'success': True,
+        'data': {
+            'total_accounts': len(ACCOUNTS),
+            'total_group_accounts': len(GROUP_ACCOUNTS),
+            'connected_accounts': connected_count,
+            'active_targets': len(active_spam_targets)
+        }
+    })
+
+# ==================== API ROUTES (GET with Password) ====================
+
+# GET API - Full Spam (with password in query)
+@app.route('/api/spam/all', methods=['GET'])
+def api_get_full_spam():
+    """GET API: Start full spam on a target (room + squad + badge + group)"""
+    uid = request.args.get('uid')
+    password = request.args.get('pass')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1332,15 +1199,23 @@ def api_spam_all():
     success, message = start_spam(uid, 'full')
     return jsonify({'success': success, 'message': message})
 
-@app.route('/api/spam/squad', methods=['GET', 'POST'])
-def api_spam_squad():
-    password = request.args.get('pass') if request.method == 'GET' else None
-    if request.method == 'POST':
-        data = request.get_json() or {}
-        uid = data.get('uid', '')
-        password = data.get('pass')
-    else:
-        uid = request.args.get('uid', '')
+# GET API - Full Spam (with UID in path) - for backward compatibility
+@app.route('/api/spam/all/<uid>', methods=['GET'])
+@login_required
+def api_get_full_spam_path(uid):
+    """GET API: Start full spam on a target (path parameter)"""
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
+    
+    success, message = start_spam(uid, 'full')
+    return jsonify({'success': success, 'message': message})
+
+# GET API - Squad Spam (with password in query)
+@app.route('/api/spam/squad', methods=['GET'])
+def api_get_squad_spam():
+    """GET API: Start squad spam on a target (group invites only)"""
+    uid = request.args.get('uid')
+    password = request.args.get('pass')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1351,15 +1226,23 @@ def api_spam_squad():
     success, message = start_spam(uid, 'squad')
     return jsonify({'success': success, 'message': message})
 
-@app.route('/api/stop', methods=['GET', 'POST'])
-def api_stop():
-    password = request.args.get('pass') if request.method == 'GET' else None
-    if request.method == 'POST':
-        data = request.get_json() or {}
-        uid = data.get('uid', '')
-        password = data.get('pass')
-    else:
-        uid = request.args.get('uid', '')
+# GET API - Squad Spam (with UID in path)
+@app.route('/api/spam/squad/<uid>', methods=['GET'])
+@login_required
+def api_get_squad_spam_path(uid):
+    """GET API: Start squad spam on a target (path parameter)"""
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
+    
+    success, message = start_spam(uid, 'squad')
+    return jsonify({'success': success, 'message': message})
+
+# GET API - Stop Spam (with password in query)
+@app.route('/api/stop', methods=['GET'])
+def api_get_stop_spam():
+    """GET API: Stop spam on a target"""
+    uid = request.args.get('uid')
+    password = request.args.get('pass')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1370,12 +1253,22 @@ def api_stop():
     success, message = stop_spam(uid)
     return jsonify({'success': success, 'message': message})
 
-@app.route('/api/stop-all', methods=['GET', 'POST'])
-def api_stop_all():
-    password = request.args.get('pass') if request.method == 'GET' else None
-    if request.method == 'POST':
-        data = request.get_json() or {}
-        password = data.get('pass')
+# GET API - Stop Spam (with UID in path)
+@app.route('/api/stop/<uid>', methods=['GET'])
+@login_required
+def api_get_stop_spam_path(uid):
+    """GET API: Stop spam on a target (path parameter)"""
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Invalid UID format!'}), 400
+    
+    success, message = stop_spam(uid)
+    return jsonify({'success': success, 'message': message})
+
+# GET API - Stop All (with password in query)
+@app.route('/api/stop-all', methods=['GET'])
+def api_get_stop_all():
+    """GET API: Stop all spam"""
+    password = request.args.get('pass')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1383,17 +1276,38 @@ def api_stop_all():
     success, message = stop_all_spam()
     return jsonify({'success': success, 'message': message})
 
+# GET API - Stop All (session based)
+@app.route('/api/stop-all', methods=['GET'])
+@login_required
+def api_get_stop_all_session():
+    """GET API: Stop all spam (session based)"""
+    success, message = stop_all_spam()
+    return jsonify({'success': success, 'message': message})
+
+# GET API - Status (with password in query)
 @app.route('/api/status', methods=['GET'])
-def api_status():
+def api_get_status():
+    """GET API: Get spam status"""
     password = request.args.get('pass')
+    
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
     
     return jsonify({'success': True, 'data': get_spam_status()})
 
+# GET API - Status (session based)
+@app.route('/api/status', methods=['GET'])
+@login_required
+def api_get_status_session():
+    """GET API: Get spam status (session based)"""
+    return jsonify({'success': True, 'data': get_spam_status()})
+
+# GET API - Accounts (with password in query)
 @app.route('/api/accounts', methods=['GET'])
-def api_accounts():
+def api_get_accounts():
+    """GET API: Get connected accounts"""
     password = request.args.get('pass')
+    
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
     
@@ -1401,12 +1315,20 @@ def api_accounts():
         accounts = list(connected_clients.keys())
     return jsonify({'success': True, 'accounts': accounts})
 
-@app.route('/api/reset', methods=['GET', 'POST'])
-def api_reset():
-    password = request.args.get('pass') if request.method == 'GET' else None
-    if request.method == 'POST':
-        data = request.get_json() or {}
-        password = data.get('pass')
+# GET API - Accounts (session based)
+@app.route('/api/accounts', methods=['GET'])
+@login_required
+def api_get_accounts_session():
+    """GET API: Get connected accounts (session based)"""
+    with connected_clients_lock:
+        accounts = list(connected_clients.keys())
+    return jsonify({'success': True, 'accounts': accounts})
+
+# GET API - Reset (with password in query)
+@app.route('/api/reset', methods=['GET'])
+def api_get_reset():
+    """GET API: Manually trigger auto reset"""
+    password = request.args.get('pass')
     
     if password != ADMIN_PASSWORD:
         return jsonify({'success': False, 'message': 'Invalid password!'}), 401
@@ -1414,7 +1336,97 @@ def api_reset():
     success, message = trigger_manual_reset()
     return jsonify({'success': success, 'message': message})
 
-# ==================== HTML TEMPLATES ====================
+# GET API - Reset (session based)
+@app.route('/api/reset', methods=['GET'])
+@login_required
+def api_get_reset_session():
+    """GET API: Manually trigger auto reset (session based)"""
+    success, message = trigger_manual_reset()
+    return jsonify({'success': success, 'message': message})
+
+# ==================== API ROUTES (POST) ====================
+
+# POST API - Full Spam
+@app.route('/api/spam/all', methods=['POST'])
+@login_required
+def api_post_full_spam():
+    """POST API: Start full spam on target(s)"""
+    data = request.get_json()
+    uid = data.get('uid', '').strip()
+    
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
+    
+    if ',' in uid:
+        uids = [u.strip() for u in uid.split(',') if u.strip().isdigit()]
+    elif ' ' in uid:
+        uids = [u.strip() for u in uid.split() if u.strip().isdigit()]
+    else:
+        uids = [uid]
+    
+    results = []
+    for target in uids:
+        success, message = start_spam(target, 'full')
+        results.append({'uid': target, 'success': success, 'message': message})
+    
+    return jsonify({'success': True, 'results': results})
+
+# POST API - Squad Spam
+@app.route('/api/spam/squad', methods=['POST'])
+@login_required
+def api_post_squad_spam():
+    """POST API: Start squad spam on target(s)"""
+    data = request.get_json()
+    uid = data.get('uid', '').strip()
+    
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
+    
+    if ',' in uid:
+        uids = [u.strip() for u in uid.split(',') if u.strip().isdigit()]
+    elif ' ' in uid:
+        uids = [u.strip() for u in uid.split() if u.strip().isdigit()]
+    else:
+        uids = [uid]
+    
+    results = []
+    for target in uids:
+        success, message = start_spam(target, 'squad')
+        results.append({'uid': target, 'success': success, 'message': message})
+    
+    return jsonify({'success': True, 'results': results})
+
+# POST API - Stop Spam
+@app.route('/api/stop', methods=['POST'])
+@login_required
+def api_post_stop_spam():
+    """POST API: Stop spam on a target"""
+    data = request.get_json()
+    uid = data.get('uid', '').strip()
+    
+    if not uid or not uid.isdigit():
+        return jsonify({'success': False, 'message': 'Valid UID required!'}), 400
+    
+    success, message = stop_spam(uid)
+    return jsonify({'success': success, 'message': message})
+
+# POST API - Stop All
+@app.route('/api/stop-all', methods=['POST'])
+@login_required
+def api_post_stop_all():
+    """POST API: Stop all spam"""
+    success, message = stop_all_spam()
+    return jsonify({'success': success, 'message': message})
+
+# POST API - Reset
+@app.route('/api/reset', methods=['POST'])
+@login_required
+def api_post_reset():
+    """POST API: Manually trigger auto reset"""
+    success, message = trigger_manual_reset()
+    return jsonify({'success': success, 'message': message})
+
+# ==================== LOGIN TEMPLATE ====================
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1557,6 +1569,7 @@ LOGIN_TEMPLATE = '''
 </html>
 '''
 
+# ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1607,6 +1620,14 @@ HTML_TEMPLATE = '''
         .btn-outline { background: transparent; border: 1px solid rgba(255,255,255,0.15); color: #fff; }
         .btn-outline:hover { background: rgba(255,255,255,0.05); }
         .btn-sm { padding: 8px 14px; font-size: 0.8rem; }
+        .btn-cyan { background: linear-gradient(135deg, #00d2ff, #3a7bd5); color: #fff; }
+        .btn-cyan:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(0,210,255,0.3); }
+        .upload-area { border: 2px dashed rgba(255,255,255,0.1); border-radius: 12px; padding: 20px; text-align: center; transition: 0.3s; cursor: pointer; }
+        .upload-area:hover { border-color: rgba(255,0,127,0.3); background: rgba(255,0,127,0.03); }
+        .upload-area.dragover { border-color: #ff007f; background: rgba(255,0,127,0.05); }
+        .upload-area i { font-size: 2rem; color: rgba(255,255,255,0.2); margin-bottom: 10px; }
+        .upload-area p { color: rgba(255,255,255,0.3); font-size: 0.85rem; }
+        .upload-area .filename { color: #00ffcc; font-weight: 600; }
         .active-list { max-height: 400px; overflow-y: auto; margin-top: 10px; }
         .active-item { background: rgba(30,30,40,0.6); padding: 12px 16px; margin: 6px 0; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid #ff007f; }
         .active-uid { font-family: monospace; font-weight: bold; color: #ff007f; font-size: 14px; }
@@ -1620,11 +1641,9 @@ HTML_TEMPLATE = '''
         .console-line .success { color: #00ffcc; }
         .console-line .error { color: #ff3366; }
         .console-line .info { color: #4facfe; }
-        .badge-info { background: rgba(155,89,182,0.08); color: #9b59b6; border: 1px solid rgba(155,89,182,0.15); padding: 10px; border-radius: 10px; text-align: center; font-size: 0.8rem; margin-top: 10px; }
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
-        .status-dot.active { background: #00ffcc; animation: pulse 1s infinite; }
-        .status-dot.idle { background: #ff4444; }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .file-status { margin-top: 8px; font-size: 0.75rem; color: rgba(255,255,255,0.3); }
+        .file-status .ok { color: #00ffcc; }
+        .file-status .pending { color: #ffaa00; }
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); border-radius: 10px; }
         ::-webkit-scrollbar-thumb { background: #ff007f; border-radius: 10px; }
@@ -1634,11 +1653,8 @@ HTML_TEMPLATE = '''
         .toast.error { border-color: #ff0844; }
         .toast.info { border-color: #4facfe; }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-        .spam-type-toggle { display: flex; gap: 10px; margin: 10px 0; }
-        .spam-type-btn { flex: 1; padding: 8px; background: rgba(30,30,40,0.4); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; cursor: pointer; text-align: center; transition: 0.3s; font-size: 0.8rem; }
-        .spam-type-btn.active { background: linear-gradient(135deg, #ff007f, #7f00ff); border-color: #ff007f; }
-        .spam-type-btn:hover { border-color: rgba(255,0,127,0.3); }
-        .api-hint { background: rgba(0,212,255,0.05); border: 1px dashed rgba(0,212,255,0.2); border-radius: 8px; padding: 8px 12px; font-size: 0.7rem; color: rgba(255,255,255,0.4); margin-top: 10px; font-family: monospace; overflow-x: auto; white-space: nowrap; }
+        .progress-bar { width: 100%; height: 4px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; margin-top: 10px; display: none; }
+        .progress-bar .fill { height: 100%; background: linear-gradient(90deg, #ff007f, #7f00ff); border-radius: 4px; transition: width 0.3s; width: 0%; }
         @media (max-width: 768px) { .controls-grid { grid-template-columns: 1fr; } .input-group { flex-direction: column; } .btn { width: 100%; justify-content: center; } .header { flex-direction: column; text-align: center; } }
     </style>
 </head>
@@ -1650,17 +1666,48 @@ HTML_TEMPLATE = '''
                 <div class="logo"><i class="fas fa-bolt"></i> MAHIR SYSTEM</div>
                 <div style="color: rgba(255,255,255,0.3); font-size:0.85rem;">SPAM CONTROL ENGINE v3.0</div>
             </div>
-            <a href="/logout" class="btn btn-outline btn-sm"><i class="fas fa-sign-out-alt"></i> LOGOUT</a>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <a href="/logout" class="btn btn-outline btn-sm"><i class="fas fa-sign-out-alt"></i> LOGOUT</a>
+            </div>
         </div>
 
         <div class="stats-grid">
             <div class="stat-card"><i class="fas fa-bullseye"></i><h3>ACTIVE TARGETS</h3><div class="value" id="activeCount">0</div></div>
             <div class="stat-card"><i class="fas fa-robot"></i><h3>BOT ACCOUNTS</h3><div class="value" id="botCount">0</div></div>
-            <div class="stat-card"><i class="fas fa-users"></i><h3>INVITE TARGETS</h3><div class="value" id="inviteCount">0</div></div>
-            <div class="stat-card"><i class="fas fa-clock"></i><h3>AUTO RESET</h3><div class="value" style="font-size:1.2rem;">7 MINUTES</div></div>
+            <div class="stat-card"><i class="fas fa-users"></i><h3>GROUP ACCOUNTS</h3><div class="value" id="groupCount">0</div></div>
+            <div class="stat-card"><i class="fas fa-clock"></i><h3>AUTO RESET</h3><div class="value" style="font-size:1.2rem;">2 HOURS</div></div>
         </div>
 
+        <!-- ========== FILE UPLOAD SECTION ========== -->
         <div class="controls-grid">
+            <div class="control-card">
+                <h3><i class="fas fa-upload"></i> UPLOAD ACCOUNTS</h3>
+                <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Upload accs.txt for Full Spam</div>
+                <div class="upload-area" id="accsUpload">
+                    <i class="fas fa-file-alt"></i>
+                    <p>Drop <span class="filename">accs.txt</span> here or click to browse</p>
+                    <input type="file" id="accsFileInput" accept=".txt" style="display:none;">
+                    <div class="file-status" id="accsStatus">No file uploaded</div>
+                </div>
+                <div class="progress-bar" id="accsProgress"><div class="fill"></div></div>
+            </div>
+
+            <div class="control-card">
+                <h3><i class="fas fa-upload"></i> UPLOAD GROUP</h3>
+                <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Upload group.txt for Squad Spam</div>
+                <div class="upload-area" id="groupUpload">
+                    <i class="fas fa-users"></i>
+                    <p>Drop <span class="filename">group.txt</span> here or click to browse</p>
+                    <input type="file" id="groupFileInput" accept=".txt" style="display:none;">
+                    <div class="file-status" id="groupStatus">No file uploaded</div>
+                </div>
+                <div class="progress-bar" id="groupProgress"><div class="fill"></div></div>
+            </div>
+        </div>
+
+        <!-- ========== SPAM CONTROLS ========== -->
+        <div class="controls-grid">
+            <!-- Full Spam Control -->
             <div class="control-card">
                 <h3><i class="fas fa-fire"></i> FULL SPAM</h3>
                 <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Room + Squad + Badge + Group Invites</div>
@@ -1668,9 +1715,10 @@ HTML_TEMPLATE = '''
                     <input type="text" id="fullUid" placeholder="Target UID(s) (comma separated)">
                     <button class="btn btn-primary" onclick="startFullSpam()"><i class="fas fa-play"></i> START</button>
                 </div>
-                <div class="api-hint">GET: /api/spam/all?uid=UID&pass=MAHIRJOD</div>
+                <div class="api-hint">GET: /api/spam/all/&lt;UID&gt; | POST: /api/spam/all</div>
             </div>
 
+            <!-- Squad Spam Control -->
             <div class="control-card">
                 <h3><i class="fas fa-users"></i> SQUAD SPAM</h3>
                 <div style="font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">Group Invites Only (3, 5, 6 Player)</div>
@@ -1678,11 +1726,12 @@ HTML_TEMPLATE = '''
                     <input type="text" id="squadUid" placeholder="Target UID(s) (comma separated)">
                     <button class="btn btn-success" onclick="startSquadSpam()"><i class="fas fa-play"></i> START</button>
                 </div>
-                <div class="api-hint">GET: /api/spam/squad?uid=UID&pass=MAHIRJOD</div>
+                <div class="api-hint">GET: /api/spam/squad/&lt;UID&gt; | POST: /api/spam/squad</div>
             </div>
         </div>
 
         <div class="controls-grid">
+            <!-- Stop Controls -->
             <div class="control-card">
                 <h3><i class="fas fa-stop"></i> STOP SPAM</h3>
                 <div class="input-group">
@@ -1693,19 +1742,24 @@ HTML_TEMPLATE = '''
                     <button class="btn btn-warning" onclick="stopAllSpam()" style="flex:1;"><i class="fas fa-stop-circle"></i> STOP ALL</button>
                     <button class="btn btn-purple" onclick="triggerReset()" style="flex:1;"><i class="fas fa-sync"></i> RESET NOW</button>
                 </div>
-                <div class="api-hint">GET: /api/stop?uid=UID&pass=MAHIRJOD | GET: /api/stop-all?pass=MAHIRJOD</div>
+                <div class="api-hint">GET: /api/stop/&lt;UID&gt; | GET: /api/stop-all | GET: /api/reset</div>
             </div>
 
+            <!-- File Info -->
             <div class="control-card">
                 <h3><i class="fas fa-file"></i> ACCOUNT FILES</h3>
                 <div style="background:rgba(0,0,0,0.3); padding:12px; border-radius:8px; font-size:0.85rem;">
-                    <div><span style="color:#00ffcc;">📁 accs.txt</span> <span id="accCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Bots</span></div>
-                    <div><span style="color:#ffaa00;">📁 inv_uid.txt</span> <span id="inviteFileCount" style="color:rgba(255,255,255,0.4);">0 targets</span> <span style="color:rgba(255,255,255,0.2);">→ Active Targets</span></div>
-                    <div style="font-size:0.7rem; color:rgba(255,255,255,0.2); margin-top:8px;">Place UIDs in inv_uid.txt for auto-spam</div>
+                    <div><span style="color:#00ffcc;">📁 accs.txt</span> <span id="accCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Room Spam</span></div>
+                    <div><span style="color:#ffaa00;">📁 group.txt</span> <span id="groupFileCount" style="color:rgba(255,255,255,0.4);">0 accounts</span> <span style="color:rgba(255,255,255,0.2);">→ Squad Spam</span></div>
+                    <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
+                        <button class="btn btn-cyan btn-sm" onclick="downloadAccs()"><i class="fas fa-download"></i> Download accs.txt</button>
+                        <button class="btn btn-cyan btn-sm" onclick="downloadGroup()"><i class="fas fa-download"></i> Download group.txt</button>
+                    </div>
                 </div>
             </div>
         </div>
 
+        <!-- Active Targets -->
         <div class="control-card" style="margin-bottom:30px;">
             <h3><i class="fas fa-list"></i> ACTIVE TARGETS</h3>
             <div id="activeList" class="active-list">
@@ -1713,14 +1767,16 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
+        <!-- Console -->
         <div class="control-card" style="margin-bottom:30px;">
             <h3><i class="fas fa-terminal"></i> CONSOLE</h3>
             <div class="console-box" id="consoleBox">
                 <div class="console-line"><span class="time">[System]</span> <span class="info">MAHIR SPAM ENGINE Initialized</span></div>
-                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset every 7 minutes</span></div>
+                <div class="console-line"><span class="time">[System]</span> <span class="info">Auto-reset every 2 hours</span></div>
             </div>
         </div>
 
+        <!-- Connected Accounts -->
         <div class="control-card">
             <h3><i class="fas fa-robot"></i> CONNECTED ACCOUNTS</h3>
             <div id="accountsContainer">
@@ -1729,11 +1785,12 @@ HTML_TEMPLATE = '''
         </div>
 
         <div class="footer">
-            MAHIR SYSTEM v3.0 | <i class="fas fa-code"></i> Engine by MAHIR | Auto Reset: 7 Minutes
+            MAHIR SYSTEM v3.0 | <i class="fas fa-code"></i> Engine by MAHIR | Auto Reset: 2 Hours
         </div>
     </div>
 
     <script>
+        // Matrix Background
         const canvas = document.getElementById('matrix-canvas');
         const ctx = canvas.getContext('2d');
         canvas.width = window.innerWidth;
@@ -1759,6 +1816,7 @@ HTML_TEMPLATE = '''
         }
         setInterval(drawMatrix, 50);
 
+        // Toast notifications
         function showToast(msg, type = 'info') {
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
@@ -1768,6 +1826,7 @@ HTML_TEMPLATE = '''
             setTimeout(() => toast.remove(), 4000);
         }
 
+        // Console log
         function logToConsole(msg, type = 'info') {
             const consoleBox = document.getElementById('consoleBox');
             const now = new Date();
@@ -1780,6 +1839,127 @@ HTML_TEMPLATE = '''
             if (consoleBox.children.length > 100) consoleBox.removeChild(consoleBox.children[0]);
         }
 
+        // ========== FILE UPLOAD FUNCTIONS ==========
+        
+        // Upload accs.txt
+        function uploadAccsFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            document.getElementById('accsProgress').style.display = 'block';
+            document.getElementById('accsProgress').querySelector('.fill').style.width = '30%';
+            
+            fetch('/api/upload/accs', {
+                method: 'POST',
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('accsProgress').querySelector('.fill').style.width = '100%';
+                setTimeout(() => {
+                    document.getElementById('accsProgress').style.display = 'none';
+                    document.getElementById('accsProgress').querySelector('.fill').style.width = '0%';
+                }, 1000);
+                
+                if (data.success) {
+                    document.getElementById('accsStatus').innerHTML = `<span class="ok">✅ Uploaded: ${data.count} accounts</span>`;
+                    showToast(data.message, 'success');
+                    logToConsole(`📁 Uploaded accs.txt: ${data.count} accounts`, 'success');
+                    refreshStatus();
+                } else {
+                    document.getElementById('accsStatus').innerHTML = `<span style="color:#ff4444;">❌ ${data.message}</span>`;
+                    showToast(data.message, 'error');
+                }
+            })
+            .catch(err => {
+                document.getElementById('accsProgress').style.display = 'none';
+                showToast('Upload failed: ' + err.message, 'error');
+            });
+        }
+
+        // Upload group.txt
+        function uploadGroupFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            document.getElementById('groupProgress').style.display = 'block';
+            document.getElementById('groupProgress').querySelector('.fill').style.width = '30%';
+            
+            fetch('/api/upload/group', {
+                method: 'POST',
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('groupProgress').querySelector('.fill').style.width = '100%';
+                setTimeout(() => {
+                    document.getElementById('groupProgress').style.display = 'none';
+                    document.getElementById('groupProgress').querySelector('.fill').style.width = '0%';
+                }, 1000);
+                
+                if (data.success) {
+                    document.getElementById('groupStatus').innerHTML = `<span class="ok">✅ Uploaded: ${data.count} accounts</span>`;
+                    showToast(data.message, 'success');
+                    logToConsole(`📁 Uploaded group.txt: ${data.count} accounts`, 'success');
+                    refreshStatus();
+                } else {
+                    document.getElementById('groupStatus').innerHTML = `<span style="color:#ff4444;">❌ ${data.message}</span>`;
+                    showToast(data.message, 'error');
+                }
+            })
+            .catch(err => {
+                document.getElementById('groupProgress').style.display = 'none';
+                showToast('Upload failed: ' + err.message, 'error');
+            });
+        }
+
+        // Setup file upload handlers
+        function setupUpload(areaId, inputId, uploadFn) {
+            const area = document.getElementById(areaId);
+            const input = document.getElementById(inputId);
+            
+            area.addEventListener('click', () => input.click());
+            
+            area.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                area.classList.add('dragover');
+            });
+            
+            area.addEventListener('dragleave', () => {
+                area.classList.remove('dragover');
+            });
+            
+            area.addEventListener('drop', (e) => {
+                e.preventDefault();
+                area.classList.remove('dragover');
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    uploadFn(files[0]);
+                }
+            });
+            
+            input.addEventListener('change', (e) => {
+                if (input.files.length > 0) {
+                    uploadFn(input.files[0]);
+                }
+            });
+        }
+
+        setupUpload('accsUpload', 'accsFileInput', uploadAccsFile);
+        setupUpload('groupUpload', 'groupFileInput', uploadGroupFile);
+
+        // Download files
+        function downloadAccs() {
+            window.location.href = '/api/get/accs';
+        }
+
+        function downloadGroup() {
+            window.location.href = '/api/get/group';
+        }
+
+        // ========== SPAM FUNCTIONS ==========
+
+        // Start Full Spam
         function startFullSpam() {
             const uid = document.getElementById('fullUid').value.trim();
             if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
@@ -1792,7 +1972,7 @@ HTML_TEMPLATE = '''
             fetch('/api/spam/all', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ uid: uid, pass: 'MAHIRJOD' })
+                body: JSON.stringify({ uid: uid })
             })
             .then(res => res.json())
             .then(data => {
@@ -1806,6 +1986,7 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
+        // Start Squad Spam
         function startSquadSpam() {
             const uid = document.getElementById('squadUid').value.trim();
             if (!uid) { showToast('Enter target UID(s)!', 'error'); return; }
@@ -1818,7 +1999,7 @@ HTML_TEMPLATE = '''
             fetch('/api/spam/squad', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ uid: uid, pass: 'MAHIRJOD' })
+                body: JSON.stringify({ uid: uid })
             })
             .then(res => res.json())
             .then(data => {
@@ -1832,6 +2013,7 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
+        // Stop Single Spam
         function stopSingleSpam() {
             const uid = document.getElementById('stopUid').value.trim();
             if (!uid) { showToast('Enter target UID to stop!', 'error'); return; }
@@ -1839,7 +2021,7 @@ HTML_TEMPLATE = '''
 
             logToConsole(`🛑 Stopping spam on ${uid}`, 'info');
             
-            fetch(`/api/stop?uid=${uid}&pass=MAHIRJOD`)
+            fetch(`/api/stop/${uid}`)
             .then(res => res.json())
             .then(data => {
                 if (data.success) {
@@ -1853,12 +2035,13 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
+        // Stop All Spam
         function stopAllSpam() {
             if (!confirm('⚠️ Stop all spam?')) return;
             
             logToConsole('🛑 Stopping ALL spam', 'info');
             
-            fetch('/api/stop-all?pass=MAHIRJOD')
+            fetch('/api/stop-all')
             .then(res => res.json())
             .then(data => {
                 if (data.success) {
@@ -1869,12 +2052,13 @@ HTML_TEMPLATE = '''
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
 
+        // Trigger Reset
         function triggerReset() {
-            if (!confirm('🔄 Manually trigger auto reset?')) return;
+            if (!confirm('🔄 Manually trigger auto reset? This will stop all spam and reload accounts.')) return;
             
             logToConsole('🔄 Triggering manual reset...', 'info');
             
-            fetch('/api/reset?pass=MAHIRJOD')
+            fetch('/api/reset')
             .then(res => res.json())
             .then(data => {
                 if (data.success) {
@@ -1884,6 +2068,14 @@ HTML_TEMPLATE = '''
             })
             .catch(err => { showToast('Error: ' + err.message, 'error'); });
         }
+
+        // Quick Stop
+        function quickStop(uid) {
+            document.getElementById('stopUid').value = uid;
+            stopSingleSpam();
+        }
+
+        // ========== REFRESH STATUS ==========
 
         function refreshStatus() {
             fetch('/api/status?pass=MAHIRJOD')
@@ -1893,7 +2085,6 @@ HTML_TEMPLATE = '''
                     const status = data.data;
                     document.getElementById('activeCount').textContent = status.active_count || 0;
                     document.getElementById('botCount').textContent = status.accounts_count || 0;
-                    document.getElementById('inviteCount').textContent = (status.invite_uids || []).length;
             
                     const activeList = document.getElementById('activeList');
                     if (status.active_targets && status.active_targets.length > 0) {
@@ -1914,6 +2105,7 @@ HTML_TEMPLATE = '''
             })
             .catch(err => console.error('Status refresh error:', err));
 
+            // Refresh accounts
             fetch('/api/accounts?pass=MAHIRJOD')
             .then(res => res.json())
             .then(data => {
@@ -1929,16 +2121,25 @@ HTML_TEMPLATE = '''
                 }
             })
             .catch(err => console.error('Accounts refresh error:', err));
+
+            // Get account counts
+            fetch('/api/accounts/count')
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('accCount').textContent = data.data.total_accounts + ' accounts';
+                    document.getElementById('groupFileCount').textContent = data.data.total_group_accounts + ' accounts';
+                    document.getElementById('groupCount').textContent = data.data.total_group_accounts || 0;
+                }
+            })
+            .catch(err => console.error('Count refresh error:', err));
         }
 
-        function quickStop(uid) {
-            document.getElementById('stopUid').value = uid;
-            stopSingleSpam();
-        }
-
+        // Auto refresh every 5 seconds
         setInterval(refreshStatus, 5000);
         refreshStatus();
 
+        // Enter key support
         document.getElementById('fullUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startFullSpam(); });
         document.getElementById('squadUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') startSquadSpam(); });
         document.getElementById('stopUid').addEventListener('keypress', (e) => { if (e.key === 'Enter') stopSingleSpam(); });
@@ -1952,42 +2153,38 @@ def main():
     print(f"""
     {C}{BOLD}
     ╔══════════════════════════════════════════════════════════════════════╗
-    ║              🎯 MAHIR SPAM ULTIMATE MULTI-TARGET 🎯                  ║
+    ║              🎯 MAHIR SPAM SYSTEM v3.0 🎯                           ║
     ║                                                                      ║
-    ║     📁 auto_uid.txt  → SMART MONITORED (স্ট্যাটাস দেখে স্প্যাম)      ║
-    ║     📁 inv_uid.txt   → ACTIVE TARGETS (সরাসরি স্প্যাম)               ║
+    ║     📁 accs.txt     → Room + Squad + Badge + Group Spam              ║
+    ║     📁 group.txt    → Squad Creation + Group Invite                  ║
     ║                                                                      ║
-    ║     ✅ 3/5/6 প্লেয়ার গ্রুপ ইনভাইট                                  ║
-    ║     ✅ V-BADGE + PRO_BADGE + CRAFTLAND + MODERATOR জয়িন             ║
-    ║     ✅ স্মার্ট মনিটরিং - স্ট্যাটাস দেখে অটো স্প্যাম                  ║
-    ║     ✅ প্রতি ৭ মিনিটে অটো রিফ্রেশ                                    ║
+    ║     ✅ Full Spam: Room + Squad + Badge + Group Invite               ║
+    ║     ✅ Squad Spam: Group Invites Only (3, 5, 6 Player)              ║
+    ║     ✅ Auto Reset: Every 2 Hours                                    ║
+    ║     ✅ GET/POST API Support                                         ║
+    ║     ✅ Web File Upload Support                                      ║
     ║                                                                      ║
-    ║     🌐 ওয়েব প্যানেল: http://127.0.0.1:8080                         ║
-    ║     👑 ডেভেলপার: MAHIR                                             ║
+    ║     🌐 Web Panel: http://127.0.0.1:8080                            ║
+    ║     🔑 Password: MAHIRJOD                                           ║
+    ║     👑 Developer: MAHIR                                             ║
     ╚══════════════════════════════════════════════════════════════════════╝
     {RS}
     """)
     
-    # Load files
-    load_invite_uids()
-    load_auto_uids()
-    
-    # Start accounts
+    # Start accounts from files
     Thread(target=run_accounts, daemon=True).start()
+    Thread(target=run_group_accounts, daemon=True).start()
     
-    # Start auto refresh timer
-    start_auto_refresh()
-    
-    # Start invite targets spam
-    if invite_uids:
-        start_invite_targets_spam()
-    
-    # Start smart monitors
-    for uid in auto_uids:
-        start_smart_monitor(uid)
+    # Start auto reset
+    start_auto_reset()
     
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 if __name__ == "__main__":
+    try:
+        import aiohttp
+    except ImportError:
+        os.system("pip install aiohttp")
+    
     main()
