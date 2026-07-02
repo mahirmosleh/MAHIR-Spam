@@ -1,20 +1,16 @@
-import os, sys, time, json, ssl, socket, threading, asyncio, base64, binascii, re, jwt, pickle, random
+import os, sys, time, json, socket, threading, asyncio, re, jwt, random
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, send_from_directory, Response
 from functools import wraps
-import tempfile
-import shutil
-
 import requests
 import urllib3
-from Pb2 import MajoRLoGinrEq_pb2
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from google.protobuf.timestamp_pb2 import Timestamp
 
-# কাস্টম মডিউল
+# ========== আপনার কাস্টম মডিউল ==========
+from Pb2 import MajoRLoGinrEq_pb2
 from byte import *
 from byte import xSEndMsg, Auth_Chat
 from xHeaders import *
@@ -35,7 +31,8 @@ def login_required(f):
 # ==================== কনফিগ ====================
 ADMIN_PASSWORD = "MAHIRJOD"
 SECRET_KEY = "mahir_system_secret_key_2024"
-AUTO_RESET_INTERVAL = 2 * 60 * 60
+AUTO_RESET_INTERVAL = 2 * 60 * 60  # 2 ঘণ্টা
+SSE_INTERVAL = 2  # সেকেন্ড
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -94,39 +91,78 @@ def load_group_accounts(filename="group.txt"):
 ACCOUNTS = load_accounts(ACCOUNTS_FILE)
 GROUP_ACCOUNTS = load_group_accounts(GROUP_ACCOUNTS_FILE)
 
-# ==================== প্যাকেট ক্রিয়েটর (পূর্বের মতো) ====================
-# ... (এখানে আগের সব packet function গুলো থাকবে, সংক্ষিপ্ততার জন্য বাদ দিলাম)
-# যেহেতু এগুলো আগের মতোই, আমি শুধু গুরুত্বপূর্ণ ফাংশনগুলো রাখছি।
-
+# ==================== প্যাকেট ক্রিয়েটর (শুধু ব্যাজ ও গ্রুপ ইনভাইট) ====================
 def create_group_invite_packet(key, iv, target_uid, players=5, region="BD"):
-    # আগের মতো
-    pass
+    try:
+        group_type = GROUP_CONFIGS[players]["type"]
+        proto_fields = {
+            1: 33,
+            2: {
+                1: int(target_uid), 2: region.upper(), 3: 1, 4: 1,
+                5: bytes([1,7,9,10,11,18,25,26,32]),
+                6: "[C][B][FF0000] INVITE",
+                7: 330, 8: 1000, 10: region.upper(),
+                11: bytes.fromhex("61"*32),
+                12: 1, 13: int(target_uid),
+                14: {1: random.randint(1000000000,9999999999), 2: group_type,
+                     3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"},
+                16: 1, 17: 1, 18: 312, 19: 46,
+                23: bytes([16,1,24,1]),
+                24: random.randint(902000000,902050099),
+                26: "", 28: ""
+            },
+            10: "en",
+            13: {2:1, 3:1}
+        }
+        packet = CrEaTe_ProTo(proto_fields).hex()
+        ptype = "0519" if region.lower()=="bd" else "0515"
+        encrypted = EnC_PacKeT(packet, key, iv)
+        length = len(encrypted)//2
+        len_hex = DecodE_HeX(length)
+        padding = {2:"000000",3:"00000",4:"0000",5:"000"}.get(len(len_hex), "000")
+        return bytes.fromhex(ptype + padding + len_hex + encrypted)
+    except:
+        return None
 
 def create_badge_join_packet(key, iv, target_uid, badge_value, region="BD"):
-    pass
+    try:
+        avatar = random.choice([902000011,902000013,902047016,902049015,902000154,902000127,902000207,902000305,902037031,902042011,902053016,902053018])
+        proto_fields = {
+            1: 33,
+            2: {
+                1: int(target_uid), 2: region.upper(), 3:1, 4:1,
+                5: bytes([1,7,9,10,11,18,25,26,32]),
+                6: "[C][B][FF0000] MAHIR BADGE",
+                7:330, 8:1000, 10: region.upper(),
+                11: bytes.fromhex("61"*32), 12:1, 13:int(target_uid),
+                14: {1: random.randint(1000000000,9999999999), 2:8,
+                     3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"},
+                16:1,17:1,18:312,19:46,
+                23: bytes([16,1,24,1]),
+                24: avatar, 26:"", 28:"",
+                31:{1:1,2:badge_value}, 32:badge_value,
+                34:{1:int(target_uid),2:8,3:bytes([15,6,21,8,10,11,19,12,17,4,14,20,7,2,1,5,16,3,13,18])}
+            },
+            10:"en",
+            13:{2:1,3:1}
+        }
+        packet = CrEaTe_ProTo(proto_fields).hex()
+        ptype = "0519" if region.lower()=="bd" else "0515"
+        encrypted = EnC_PacKeT(packet, key, iv)
+        length = len(encrypted)//2
+        len_hex = DecodE_HeX(length)
+        padding = {2:"000000",3:"00000",4:"0000",5:"000"}.get(len(len_hex), "000")
+        return bytes.fromhex(ptype + padding + len_hex + encrypted)
+    except:
+        return None
 
-def encode_varint_sync(value: int) -> bytes:
-    pass
-
-def create_proto_sync(fields):
-    pass
-
-async def OpEnSq(K, V, region):
-    pass
-
-async def cHSq(Nu, Uid, K, V, region):
-    pass
-
-async def SEnd_InV(Nu, Uid, K, V, region):
-    pass
-
-async def ExiT(K, V):
-    pass
+# ==================== স্প্যাম ওয়ার্কার (অপটিমাইজড) ====================
+# একক ইভেন্ট লুপ শেয়ার করার জন্য
+_loop = asyncio.new_event_loop()
 
 def run_async(coro):
-    pass
+    return _loop.run_until_complete(coro)
 
-# ==================== স্প্যাম ওয়ার্কার ====================
 def send_full_spam(client, target_uid):
     total = 0
     try:
@@ -135,31 +171,52 @@ def send_full_spam(client, target_uid):
         # রুম স্প্যাম
         try:
             open_pkt = openroom(client.key, client.iv)
-            if open_pkt: client.CliEnts2.send(open_pkt)
+            if open_pkt:
+                client.CliEnts2.send(open_pkt)
             spam_pkt = spmroom(client.key, client.iv, target_uid)
-            if spam_pkt: client.CliEnts2.send(spam_pkt); total += 1
-        except: pass
+            if spam_pkt:
+                client.CliEnts2.send(spam_pkt)
+                total += 1
+        except:
+            pass
         # স্কোয়াড ইনভাইট
         try:
-            run_async(OpEnSq(client.key, client.iv, "BD"))
-            run_async(cHSq(5, target_uid, client.key, client.iv, "BD"))
-            run_async(SEnd_InV(5, target_uid, client.key, client.iv, "BD"))
-            run_async(ExiT(client.key, client.iv))
+            p1 = OpEnSq(client.key, client.iv, "BD")
+            client.CliEnts2.send(p1)
+            time.sleep(0.03)
+            p2 = cHSq(5, target_uid, client.key, client.iv, "BD")
+            client.CliEnts2.send(p2)
+            time.sleep(0.03)
+            p3 = SEnd_InV(5, target_uid, client.key, client.iv, "BD")
+            client.CliEnts2.send(p3)
+            time.sleep(0.03)
+            p4 = ExiT(client.key, client.iv)
+            client.CliEnts2.send(p4)
             total += 1
-        except: pass
+        except:
+            pass
         # ব্যাজ জয়েন
         for badge_value in BADGES.values():
             try:
                 pkt = create_badge_join_packet(client.key, client.iv, target_uid, badge_value)
-                if pkt: client.CliEnts2.send(pkt); total += 1; time.sleep(0.03)
-            except: pass
+                if pkt:
+                    client.CliEnts2.send(pkt)
+                    total += 1
+                    time.sleep(0.02)
+            except:
+                pass
         # গ্রুপ ইনভাইট
         for players in [3,5,6]:
             try:
                 pkt = create_group_invite_packet(client.key, client.iv, target_uid, players)
-                if pkt: client.CliEnts2.send(pkt); total += 1; time.sleep(0.03)
-            except: pass
-    except: pass
+                if pkt:
+                    client.CliEnts2.send(pkt)
+                    total += 1
+                    time.sleep(0.02)
+            except:
+                pass
+    except:
+        pass
     return total
 
 def send_squad_spam(client, target_uid):
@@ -168,18 +225,31 @@ def send_squad_spam(client, target_uid):
         if not hasattr(client, 'CliEnts2') or not client.key:
             return 0
         try:
-            run_async(OpEnSq(client.key, client.iv, "BD"))
-            run_async(cHSq(5, target_uid, client.key, client.iv, "BD"))
-            run_async(SEnd_InV(5, target_uid, client.key, client.iv, "BD"))
-            run_async(ExiT(client.key, client.iv))
+            p1 = OpEnSq(client.key, client.iv, "BD")
+            client.CliEnts2.send(p1)
+            time.sleep(0.03)
+            p2 = cHSq(5, target_uid, client.key, client.iv, "BD")
+            client.CliEnts2.send(p2)
+            time.sleep(0.03)
+            p3 = SEnd_InV(5, target_uid, client.key, client.iv, "BD")
+            client.CliEnts2.send(p3)
+            time.sleep(0.03)
+            p4 = ExiT(client.key, client.iv)
+            client.CliEnts2.send(p4)
             total += 1
-        except: pass
+        except:
+            pass
         for players in [3,6]:
             try:
                 pkt = create_group_invite_packet(client.key, client.iv, target_uid, players)
-                if pkt: client.CliEnts2.send(pkt); total += 1; time.sleep(0.03)
-            except: pass
-    except: pass
+                if pkt:
+                    client.CliEnts2.send(pkt)
+                    total += 1
+                    time.sleep(0.02)
+            except:
+                pass
+    except:
+        pass
     return total
 
 def spam_worker(target_uid, spam_type='full'):
@@ -190,16 +260,19 @@ def spam_worker(target_uid, spam_type='full'):
         with active_spam_lock:
             if target_uid not in active_spam_targets:
                 break
+
+        # একত্রে সব ক্লায়েন্ট নেওয়া
         with connected_clients_lock:
-            clients_list = list(connected_clients.values())
-        group_clients = []
+            all_clients = list(connected_clients.values())
+        # গ্রুপ অ্যাকাউন্টগুলোও যোগ করা
         for acc in GROUP_ACCOUNTS:
             if acc['id'] in connected_clients:
-                group_clients.append(connected_clients[acc['id']])
-        all_clients = clients_list + group_clients
+                all_clients.append(connected_clients[acc['id']])
+
         if not all_clients:
-            time.sleep(2)
+            time.sleep(1)
             continue
+
         round_num += 1
         for client in all_clients:
             with active_spam_lock:
@@ -212,10 +285,12 @@ def spam_worker(target_uid, spam_type='full'):
                     total_requests += send_squad_spam(client, target_uid)
             except:
                 pass
-            time.sleep(0.05)
-        if round_num % 10 == 0:
-            print(f"{C}{'='*50}{RS}\n{G}📊 Round {round_num} | Requests: {total_requests} | Bots: {len(all_clients)}{RS}")
-        time.sleep(0.5)
+            time.sleep(0.04)  # কমিয়ে দেওয়া
+
+        if round_num % 20 == 0:
+            print(f"{C}{'='*40}{RS}\n{G}📊 Round {round_num} | Requests: {total_requests} | Bots: {len(all_clients)}{RS}")
+        time.sleep(0.3)  # প্রতিটি রাউন্ডের মাঝে কম বিরতি
+
     with spam_threads_lock:
         if target_uid in spam_threads:
             del spam_threads[target_uid]
@@ -293,7 +368,7 @@ def trigger_manual_reset():
     auto_reset_spam()
     return True, "Manual reset triggered"
 
-# ==================== FF_CLIENT (পূর্বের মতো) ====================
+# ==================== FF_CLIENT ====================
 class FF_CLient():
     def __init__(self, uid, password):
         self.id = uid
@@ -568,7 +643,7 @@ def start_account(account):
 def run_accounts_from_list(accounts):
     for acc in accounts:
         Thread(target=start_account, args=(acc,), daemon=True).start()
-        time.sleep(0.2)
+        time.sleep(0.15)  # একটু কমিয়ে দেওয়া
 
 def run_accounts():
     global accounts_initialized, accounts_initializing
@@ -584,15 +659,14 @@ def run_accounts():
 def run_group_accounts():
     run_accounts_from_list(GROUP_ACCOUNTS)
 
-# ==================== SSE (Server-Sent Events) রিয়েল-টাইম আপডেট ====================
+# ==================== SSE STREAM ====================
 @app.route('/stream')
 def stream():
     def event_stream():
         last_data = None
         while True:
-            time.sleep(1)
+            time.sleep(SSE_INTERVAL)
             current_data = get_spam_status()
-            # অ্যাকাউন্ট কাউন্ট ও লিস্ট যোগ করি
             with connected_clients_lock:
                 current_data['accounts_count'] = len(connected_clients)
                 current_data['accounts_list'] = list(connected_clients.keys())[:50]
@@ -780,7 +854,7 @@ def api_targets():
             })
     return jsonify({'success': True, 'targets': targets})
 
-# ==================== টেমপ্লেট (HTML) ====================
+# ==================== টেমপ্লেট (আপডেটেড) ====================
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>MAHIR SYSTEM</title>
@@ -791,7 +865,10 @@ LOGIN_TEMPLATE = '''
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>MAHIR SPAM ENGINE</title>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MAHIR SPAM ENGINE</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -800,11 +877,9 @@ body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#060417,#0
 .header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:15px;padding-bottom:20px;border-bottom:1px solid rgba(255,255,255,0.05)}
 .logo{font-size:2.2rem;font-weight:800;background:linear-gradient(135deg,#ff007f,#7f00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:15px;margin:20px 0}
-.stat-card{background:rgba(255,255,255,0.03);backdrop-filter:blur(10px);border-radius:12px;padding:15px;text-align:center;border:1px solid rgba(255,255,255,0.05);transition:transform 0.3s}
+.stat-card{background:rgba(255,255,255,0.03);backdrop-filter:blur(10px);border-radius:12px;padding:15px;text-align:center;border:1px solid rgba(255,255,255,0.05);transition:0.3s}
 .stat-card:hover{transform:translateY(-4px);border-color:rgba(255,0,127,0.3)}
 .stat-card .value{font-size:1.8rem;font-weight:700}
-.stat-card .value .pulse{animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
 .controls-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin:20px 0}
 .control-card{background:rgba(255,255,255,0.02);backdrop-filter:blur(10px);border-radius:12px;padding:20px;border:1px solid rgba(255,255,255,0.05);transition:0.3s}
 .control-card:hover{border-color:rgba(255,0,127,0.2)}
@@ -821,10 +896,12 @@ body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#060417,#0
 .btn-outline{background:transparent;border:1px solid rgba(255,255,255,0.15);color:#fff}
 .btn-outline:hover{background:rgba(255,255,255,0.05)}
 .btn-sm{padding:6px 12px;font-size:0.8rem}
+.btn-cyan{background:linear-gradient(135deg,#00d2ff,#3a7bd5);color:#fff}
+.btn-cyan:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(0,210,255,0.3)}
 .upload-area{border:2px dashed rgba(255,255,255,0.1);border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:0.3s}
 .upload-area:hover{border-color:rgba(255,0,127,0.3);background:rgba(255,0,127,0.03)}
-.upload-area i{font-size:1.8rem;color:rgba(255,255,255,0.2)}
 .upload-area.dragover{border-color:#ff007f;background:rgba(255,0,127,0.05)}
+.upload-area i{font-size:1.8rem;color:rgba(255,255,255,0.2)}
 .target-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:20px;margin-top:15px}
 .target-card{background:rgba(20,20,40,0.6);border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,0.06);transition:all 0.4s cubic-bezier(0.175,0.885,0.32,1.275);backdrop-filter:blur(8px);opacity:0;transform:translateY(20px)}
 .target-card.visible{opacity:1;transform:translateY(0)}
@@ -849,17 +926,28 @@ body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#060417,#0
 .stop-small{background:#eb3349;border:none;color:#fff;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:0.7rem;transition:0.3s}
 .stop-small:hover{background:#c0392b;transform:scale(1.05)}
 .empty-state{color:rgba(255,255,255,0.3);text-align:center;padding:20px;width:100%}
-.glow-text{text-shadow:0 0 20px rgba(255,0,127,0.3)}
-.typing::after{content:'|';animation:blinkCursor 0.8s infinite}
-@keyframes blinkCursor{0%,100%{opacity:1}50%{opacity:0}}
-@media(max-width:600px){.controls-grid{grid-template-columns:1fr}.input-group{flex-direction:column}.btn{width:100%;justify-content:center}}
+
+/* Modal Styles */
+.modal{display:none;position:fixed;z-index:999;left:0;top:0;width:100%;height:100%;overflow:auto;background:rgba(0,0,0,0.8);backdrop-filter:blur(10px)}
+.modal-content{background:rgba(20,20,40,0.95);margin:2% auto;padding:20px;border:1px solid rgba(255,0,127,0.3);border-radius:16px;width:95%;max-width:1400px;max-height:90vh;overflow-y:auto;position:relative}
+.modal-close{position:absolute;right:20px;top:15px;font-size:2rem;font-weight:bold;color:#fff;cursor:pointer;transition:0.3s}
+.modal-close:hover{color:#ff007f}
+.modal-title{font-size:1.8rem;margin-bottom:20px;background:linear-gradient(135deg,#ff007f,#7f00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;display:inline-block}
+.modal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:20px}
+
+@media(max-width:600px){.controls-grid{grid-template-columns:1fr}.input-group{flex-direction:column}.btn{width:100%;justify-content:center}.modal-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <div class="container">
 <div class="header">
-<div class="logo"><i class="fas fa-bolt"></i> MAHIR SYSTEM <span class="typing" style="font-size:1rem;color:rgba(255,255,255,0.3);">v3.0</span></div>
-<div><span class="status-dot online" id="statusDot"></span><span id="statusText" style="color:rgba(255,255,255,0.5);font-size:0.85rem;">Connecting...</span><a href="/logout" class="btn btn-outline btn-sm" style="margin-left:15px;"><i class="fas fa-sign-out-alt"></i> LOGOUT</a></div>
+<div class="logo"><i class="fas fa-bolt"></i> MAHIR SYSTEM <span style="font-size:1rem;color:rgba(255,255,255,0.3);">v3.0</span></div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+    <span class="status-dot online" id="statusDot"></span>
+    <span id="statusText" style="color:rgba(255,255,255,0.5);font-size:0.85rem;">Connecting...</span>
+    <button class="btn btn-cyan btn-sm" onclick="showAllTargets()"><i class="fas fa-images"></i> Show All Targets</button>
+    <a href="/logout" class="btn btn-outline btn-sm"><i class="fas fa-sign-out-alt"></i> LOGOUT</a>
+</div>
 </div>
 <div class="stats-grid">
 <div class="stat-card"><i class="fas fa-bullseye" style="color:#ff007f;"></i><h3>ACTIVE</h3><div class="value" id="activeCount">0</div></div>
@@ -879,11 +967,27 @@ body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#060417,#0
 <div class="control-card"><h3><i class="fas fa-stop" style="color:#ff0844;"></i> STOP</h3><div class="input-group"><input id="stopUid" placeholder="Target UID"><button class="btn btn-danger" onclick="stopSingle()"><i class="fas fa-power-off"></i> STOP</button></div><div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;"><button class="btn btn-warning" onclick="stopAll()"><i class="fas fa-stop-circle"></i> STOP ALL</button><button class="btn btn-purple" onclick="resetNow()"><i class="fas fa-sync"></i> RESET</button></div></div>
 <div class="control-card"><h3><i class="fas fa-file" style="color:#4facfe;"></i> FILES</h3><div style="background:rgba(0,0,0,0.3);padding:10px;border-radius:8px;font-size:0.85rem;"><div>📁 accs.txt <span id="accCount" style="color:rgba(255,255,255,0.4);">0 accounts</span></div><div>📁 group.txt <span id="groupFileCount" style="color:rgba(255,255,255,0.4);">0 accounts</span></div><div style="display:flex;gap:8px;margin-top:8px;"><button class="btn btn-outline btn-sm" onclick="downloadAccs()"><i class="fas fa-download"></i> accs.txt</button><button class="btn btn-outline btn-sm" onclick="downloadGroup()"><i class="fas fa-download"></i> group.txt</button></div></div></div>
 </div>
-<div class="control-card"><h3><i class="fas fa-images" style="color:#ff007f;"></i> TARGETS <span style="font-size:0.8rem;color:rgba(255,255,255,0.3);">(with Banner)</span></h3><div id="targetGrid" class="target-grid"><div class="empty-state">🎯 No active targets</div></div></div>
-<div class="control-card"><h3><i class="fas fa-terminal" style="color:#00ffcc;"></i> CONSOLE</h3><div class="console-box" id="consoleBox"><div class="line">[System] MAHIR SPAM ENGINE v3.0</div><div class="line">[System] Real-time updates enabled</div></div></div>
+<div class="control-card"><h3><i class="fas fa-images" style="color:#ff007f;"></i> TARGETS <span style="font-size:0.8rem;color:rgba(255,255,255,0.3);">(with Banner)</span></h3>
+<div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+    <button class="btn btn-cyan btn-sm" onclick="showAllTargets()"><i class="fas fa-expand"></i> View All</button>
+    <button class="btn btn-outline btn-sm" onclick="refreshTargets()"><i class="fas fa-sync"></i> Refresh</button>
+</div>
+<div id="targetGrid" class="target-grid"><div class="empty-state">🎯 No active targets</div></div>
+</div>
+<div class="control-card"><h3><i class="fas fa-terminal" style="color:#00ffcc;"></i> CONSOLE</h3><div class="console-box" id="consoleBox"><div class="line">[System] MAHIR SPAM ENGINE v3.0</div><div class="line">[System] Real-time SSE enabled</div></div></div>
 <div class="control-card"><h3><i class="fas fa-robot" style="color:#4facfe;"></i> CONNECTED ACCOUNTS</h3><div id="accountsContainer"><span style="color:rgba(255,255,255,0.3);">Loading...</span></div></div>
 <div class="footer">MAHIR SYSTEM v3.0 | Auto Reset 2 Hours | <i class="fas fa-bolt" style="color:#ff007f;"></i> Real-time SSE</div>
 </div>
+
+<!-- Modal for All Targets -->
+<div id="targetModal" class="modal">
+    <div class="modal-content">
+        <span class="modal-close" onclick="closeModal()">&times;</span>
+        <div class="modal-title"><i class="fas fa-images"></i> All Targets with Banners</div>
+        <div id="modalGrid" class="modal-grid"><div class="empty-state">Loading...</div></div>
+    </div>
+</div>
+
 <script>
 // ========== SSE Real-time Stream ==========
 const evtSource = new EventSource('/stream');
@@ -906,19 +1010,23 @@ function updateUI(data) {
     document.getElementById('activeCount').textContent = data.active_count || 0;
     document.getElementById('botCount').textContent = data.accounts_count || 0;
     document.getElementById('groupCount').textContent = data.active_targets ? data.active_targets.length : 0;
-    renderTargets(data.active_targets);
+    renderTargets(data.active_targets, 'targetGrid');
     updateAccounts(data.accounts_list);
 }
 
-function renderTargets(targets) {
-    const grid = document.getElementById('targetGrid');
+function renderTargets(targets, containerId = 'targetGrid') {
+    const grid = document.getElementById(containerId);
     if (!targets || targets.length === 0) {
         grid.innerHTML = '<div class="empty-state">🎯 No active targets</div>';
         return;
     }
     grid.innerHTML = targets.map((t, index) => `
         <div class="target-card visible" style="animation-delay: ${index * 0.05}s">
-            <img src="${t.banner_url}" alt="Banner for ${t.uid}" loading="lazy" onerror="this.style.display='none'">
+            <img src="${t.banner_url}" alt="Banner for ${t.uid}" 
+                 loading="lazy" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
+            <div style="display:none;align-items:center;justify-content:center;height:150px;background:rgba(0,0,0,0.4);color:#ff007f;font-weight:bold;font-size:1.2rem;font-family:monospace;">
+                ${t.uid}
+            </div>
             <div class="info">
                 <span class="uid">🎯 ${t.uid}</span>
                 <span class="type">${t.type.toUpperCase()}</span>
@@ -939,7 +1047,51 @@ function updateAccounts(accounts) {
     ).join('');
 }
 
-// ========== Toast, Log, Upload, Spam Functions (পূর্বের মতো) ==========
+// ========== Show All Targets Modal ==========
+function showAllTargets() {
+    const modal = document.getElementById('targetModal');
+    modal.style.display = 'block';
+    document.getElementById('modalGrid').innerHTML = '<div class="empty-state">Loading targets...</div>';
+    
+    fetch('/api/targets?pass=MAHIRJOD')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success && data.targets && data.targets.length > 0) {
+                renderTargets(data.targets, 'modalGrid');
+            } else {
+                document.getElementById('modalGrid').innerHTML = '<div class="empty-state">No targets found</div>';
+            }
+        })
+        .catch(() => {
+            document.getElementById('modalGrid').innerHTML = '<div class="empty-state">Error loading targets</div>';
+        });
+}
+
+function closeModal() {
+    document.getElementById('targetModal').style.display = 'none';
+}
+
+// Close modal on outside click
+window.onclick = function(event) {
+    const modal = document.getElementById('targetModal');
+    if (event.target == modal) {
+        modal.style.display = 'none';
+    }
+};
+
+function refreshTargets() {
+    fetch('/api/targets?pass=MAHIRJOD')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                renderTargets(data.targets, 'targetGrid');
+                showToast('Targets refreshed', 'success');
+            }
+        })
+        .catch(() => showToast('Refresh failed', 'error'));
+}
+
+// ========== Toast, Log, Upload, Spam Functions ==========
 function showToast(msg,type='info'){var t=document.createElement('div');t.className='toast '+type;t.innerHTML='<i class="fas '+(type==='success'?'fa-check-circle':type==='error'?'fa-exclamation-circle':'fa-info-circle')+'"></i> '+msg;document.body.appendChild(t);setTimeout(()=>t.remove(),4000);}
 function log(msg,type='info'){var box=document.getElementById('consoleBox'),now=new Date(),line=document.createElement('div');line.className='line';line.innerHTML='<span style="color:rgba(255,255,255,0.3);">['+now.toLocaleTimeString()+']</span> <span style="color:'+(type==='success'?'#00ffcc':type==='error'?'#ff3366':'#4facfe')+';">'+msg+'</span>';box.appendChild(line);box.scrollTop=box.scrollHeight;if(box.children.length>80)box.removeChild(box.children[0]);}
 
@@ -973,7 +1125,8 @@ document.getElementById('stopUid').addEventListener('keypress',e=>{if(e.key==='E
 
 log('System ready - Real-time SSE enabled','info');
 </script>
-</body></html>
+</body>
+</html>
 '''
 
 # ==================== মেইন ====================
@@ -981,7 +1134,7 @@ def main():
     print(f"""
     {C}{BOLD}
     ╔═══════════════════════════════════════════════════════════════════╗
-    ║            🎯 MAHIR SPAM SYSTEM v3.0 🎯                          ║
+    ║            🎯 MAHIR SPAM SYSTEM v3.0 (Light) 🎯                  ║
     ║    ✅ Real-time SSE updates                                     ║
     ║    ✅ Persistent accounts                                      ║
     ║    ✅ Animated UI                                              ║
@@ -994,7 +1147,7 @@ def main():
     Thread(target=run_accounts, daemon=True).start()
     Thread(target=run_group_accounts, daemon=True).start()
     start_auto_reset()
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8081))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 if __name__ == "__main__":
